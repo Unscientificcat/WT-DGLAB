@@ -1,0 +1,73 @@
+{
+  "aircraft": {
+    "enabled": true,
+    "gforce_min": 1.0,
+    "gforce_max": 10.0,
+    "channel_a_max": 0,
+    "channel_b_max": 0,
+    "waveform_a": "恒定",
+    "waveform_b": "恒定",
+    "random_interval": 30
+  },
+  "tank": {
+    "enabled": true,
+    "speed_min": 0.0,
+    "speed_max": 60.0,
+    "channel_a_max": 60,
+    "channel_b_max": 0,
+    "waveform_a": "恒定",
+    "waveform_b": "恒定",
+    "random_interval": 30
+  },
+  "cas": {
+    "gforce_min": 1.0,
+    "gforce_max": 10.0,
+    "channel_a_max": 60,
+    "channel_b_max": 90,
+    "waveform_a": "恒定",
+    "waveform_b": "恒定",
+    "random_interval": 30
+  },
+  "events": {
+    "player_name": "",
+    "kill_enabled": false,
+    "kill_ch_a": 0,
+    "kill_ch_b": 0,
+    "kill_duration": 5.0,
+    "kill_wf_a": "恒定",
+    "kill_wf_b": "恒定",
+    "death_enabled": false,
+    "death_ch_a": 0,
+    "death_ch_b": 0,
+    "death_duration": 5.0,
+    "death_wf_a": "恒定",
+    "death_wf_b": "恒定"
+  },
+  "tank_events": {
+    "player_name": "某不科学的猫酱",
+    "kill_enabled": true,
+    "kill_ch_a": 56,
+    "kill_ch_b": 45,
+    "kill_duration": 5.0,
+    "kill_wf_a": "恒定",
+    "kill_wf_b": "恒定",
+    "death_enabled": true,
+    "death_ch_a": 0,
+    "death_ch_b": 0,
+    "death_duration": 5.0,
+    "death_wf_a": "恒定",
+    "death_wf_b": "恒定",
+    "repair_enabled": true,
+    "repair_ch_a": 76,
+    "repair_ch_b": 78,
+    "repair_wf_a": "恒定",
+    "repair_wf_b": "恒定"
+  },
+  "app": {
+    "ws_port": 8765,
+    "refresh_interval_ms": 200,
+    "mode": "tank",
+    "overlay_enabled": true,
+    "overlay_size": "中"
+  }
+}

@@ -1,0 +1,5 @@
+# tkinter — Python 自带 GUI 库，无需安装
+requests>=2.28.0
+qrcode>=7.4.0
+Pillow>=9.0.0
+pydglab-ws>=1.1.0
