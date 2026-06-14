@@ -398,6 +398,8 @@ class SettingsPanel(ttk.LabelFrame):
                            textvariable=var, width=8,
                            font=FONTS["default"])
         spin.bind("<MouseWheel>", lambda e: "break")
+        # 失焦时强制回写 IntVar（修复 ttk.Spinbox textvariable 不实时同步）
+        spin.bind("<FocusOut>", lambda e, v=var, s=spin: v.set(int(float(s.get()))))
         spin.pack(side=tk.LEFT, padx=(8, 4))
 
         if suffix:

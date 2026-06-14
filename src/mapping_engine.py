@@ -61,7 +61,7 @@ class MappingEngine:
         Returns:
             (intensity_a, intensity_b) 各通道强度 (0-200)
         """
-        intensity = MappingEngine._linear(speed, s_min, s_max)
+        intensity = MappingEngine._linear(abs(speed), s_min, s_max)
         a = int(intensity * ch_a_max)
         b = int(intensity * ch_b_max)
         return (

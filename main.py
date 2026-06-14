@@ -47,7 +47,6 @@ class App:
                                    "config.json")
         self.config_mgr = ConfigManager(config_path)
         self.config_mgr.load()
-        self._cfg = self.config_mgr.config
 
         # ===== 状态缓存（必须在 GUI 之前初始化，因为 GUI 初始化会触发回调）=====
         self._last_state = GameState()
@@ -93,6 +92,11 @@ class App:
         self._data_queue = queue.Queue(maxsize=2)  # 只保留最新游戏数据
         self._event_queue = queue.Queue(maxsize=2)  # 最新事件数据
         self._running = True
+
+    @property
+    def _cfg(self):
+        """始终返回当前 Config 对象引用（防止 reset_defaults 后引用失效）"""
+        return self.config_mgr.config
 
     # ============================================================
     # 生命周期
@@ -161,6 +165,7 @@ class App:
             try:
                 events = self._detect_events()
                 if events:
+                    logger.info(f"检测到事件: {events['kind']} mode={events.get('mode','')}")
                     try:
                         self._event_queue.put(events, block=False)
                     except queue.Full:
@@ -169,8 +174,8 @@ class App:
                             self._event_queue.put(events, block=False)
                         except queue.Empty:
                             pass
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"事件检测异常: {e}", exc_info=True)
 
             # 等待下一次轮询
             self._running_event = threading.Event()
@@ -179,11 +184,16 @@ class App:
             )
 
     def _detect_events(self) -> dict:
-        """后台线程中检测事件（不阻塞主线程）"""
-        mode = self._current_mode
-        if mode == "aircraft":
+        """后台线程中检测事件（不阻塞主线程）
+
+        根据游戏内实际载具类型选择事件配置，而非 GUI 模式。
+        这样陆战上飞机时用空战事件，在地面时用陆战事件。
+        """
+        # 优先用游戏实际载具类型，未知时回退到 GUI 模式
+        vt = self._last_state.vehicle_type or self._current_mode
+        if vt == "aircraft":
             ev_cfg = self._cfg.events
-        elif mode == "tank":
+        elif vt == "tank":
             ev_cfg = self._cfg.tank_events
         else:
             return {}
@@ -191,20 +201,20 @@ class App:
         result = {}
 
         # 维修检测（不需要昵称，基于游戏状态）
-        if mode == "tank" and ev_cfg.repair_enabled:
+        if vt == "tank" and ev_cfg.repair_enabled:
             tank = self._last_state.tank
             if tank and tank.is_repairing and not self._repair_active:
                 self._repair_active = True
                 result = {
-                    "kind": "repair", "mode": mode,
+                    "kind": "repair", "mode": vt,
                     "ch_a": ev_cfg.repair_ch_a, "ch_b": ev_cfg.repair_ch_b,
-                    "duration": 60,  # 超时保护，实际由 main 线程检测 is_repairing 结束
+                    "duration": 60,
                     "wf_a": ev_cfg.repair_wf_a, "wf_b": ev_cfg.repair_wf_b,
                 }
 
         # 击杀/死亡检测（需要昵称匹配 hudmsg）
         if ev_cfg.player_name:
-            result = self._detect_kill_death(ev_cfg, mode) or result
+            result = self._detect_kill_death(ev_cfg, vt) or result
 
         return result
 
@@ -212,6 +222,8 @@ class App:
         """检测 hudmsg 击杀/死亡事件"""
         name = ev_cfg.player_name
         records = self.game_reader.fetch_hudmsg(self._last_dmg_id)
+        if records:
+            logger.debug(f"hudmsg: 获取 {len(records)} 条新记录, last_id={self._last_dmg_id}, name={name}")
         result = {}
         ZERO_WIDTH = set("​‌‍‎‏⁠﻿")
         for r in records:
@@ -460,6 +472,8 @@ class App:
                         tk_data.speed_kmh,
                         tk_cfg.speed_min, tk_cfg.speed_max,
                         tk_cfg.channel_a_max, tk_cfg.channel_b_max)
+                else:
+                    intensity_a, intensity_b = 0, 0
                 self.window.dashboard.update_tank(
                     tk_data.speed_kmh, intensity_a, intensity_b)
             else:
@@ -508,6 +522,7 @@ class App:
         # 清空悬浮窗缓存，避免旧模式数据残留
         self._overlay_last_value = ""
         self._overlay_last_unit = ""
+        logger.info(f"模式变更: current_mode={self._current_mode} cfg.mode={self._cfg.app.mode}")
         if hasattr(self, "window") and self.window is not None:
             self._apply_game_state(self._last_state)
             self._apply_waveform()
@@ -597,6 +612,7 @@ class App:
         else:
             # 陆战模式先用坦克波形（后续会根据实际载具切 CAS）
             cfg = self._cfg.tank
+        logger.info(f"同步波形: mode={mode} A={cfg.waveform_a} B={cfg.waveform_b}")
         self.coyote.set_waveform_a(cfg.waveform_a, cfg.random_interval)
         self.coyote.set_waveform_b(cfg.waveform_b, cfg.random_interval)
 
@@ -615,7 +631,7 @@ class App:
             self._generate_qr_image(url)
             self.window.qr_widget.set_status("等待手机扫码连接...", url)
             # 延迟同步波形设置（等绑定完成）
-            self.window.after(3000, self._sync_waveform_config)
+            self.window.after(3000, self._apply_waveform)
         else:
             logger.error("郊狼服务端启动失败")
             self.window.qr_widget.set_status("⚠ 服务启动失败，请检查端口")
@@ -644,6 +660,14 @@ class App:
 
     def _send_strength(self, value_a: int, value_b: int):
         """向郊狼发送双通道强度"""
+        status = self.coyote.status
+        if value_a > 0 or value_b > 0:
+            if not status.bound:
+                logger.warning(f"强度 A={value_a} B={value_b} 但郊狼未绑定! 请手机扫码连接")
+            elif not status.server_running:
+                logger.warning(f"强度 A={value_a} B={value_b} 但服务端未运行!")
+            else:
+                logger.info(f"发送强度: A={value_a} B={value_b}")
         self.coyote.set_strength_a(value_a)
         self.coyote.set_strength_b(value_b)
 

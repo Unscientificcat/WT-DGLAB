@@ -1,12 +1,14 @@
-# WT-DGLAB
-战争雷霆 × 郊狼 3.0  —— 空战过载、陆战速度实时映射电击强度，18 种波形，透明悬浮窗
+# 郊狼雷霆 v0.1
+
+> 战争雷霆 × 郊狼 3.0 电击联动 —— 让每一发过载都传到身上
+
 [![Windows](https://img.shields.io/badge/platform-Windows-blue)](https://github.com)
 [![Python](https://img.shields.io/badge/python-3.10%2B-yellow)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ## 简介
 
-**郊狼雷霆** 是一款 Windows 桌面工具，实时读取《战争雷霆》游戏遥测数据，将空战过载、陆战速度等动态映射到**郊狼 3.0** 电击设备上
+**郊狼雷霆** 是一款 Windows 桌面工具，实时读取《战争雷霆》游戏遥测数据，将空战过载、陆战速度等动态映射到**郊狼 3.0** 电击设备上，让你**物理感受** G 力拉满的那一刻。
 
 ### 空战模式
 
@@ -84,7 +86,7 @@ python main.py
 
 ## 注意事项
 
-**⚠ 使用前请务必阅读《注意事项.txt》全文。**
+**⚠ 使用前请务必阅读《注意事项.txt》全文。每次启动都会弹出。**
 
 - 严禁心脏病患者、孕妇、未成年人使用
 - 严禁将电极贴于头部、颈部、胸部
