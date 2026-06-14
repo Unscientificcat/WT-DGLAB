@@ -1,6 +1,6 @@
 # 郊狼雷霆 v0.1
 
-> 战争雷霆 × 郊狼 3.0 电击联动 —— 让每一发过载都传到身上
+> 战争雷霆 × 郊狼 3.0  
 
 [![Windows](https://img.shields.io/badge/platform-Windows-blue)](https://github.com)
 [![Python](https://img.shields.io/badge/python-3.10%2B-yellow)](https://python.org)
