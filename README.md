@@ -291,12 +291,6 @@ python build.py
 - 战争雷霆接口字段可能随游戏更新或载具类型变化，事件识别也依赖游戏 HUD 文本。
 - 项目仍处于 beta 阶段，不建议在无人看护或高强度场景中使用。
 
-## 发布前注意
-
-- `config.json` 可能包含玩家昵称和个人强度设置，公开仓库前应确认其中没有隐私信息。
-- `wt-dglab-trace.log` 属于诊断日志，不应作为正式发布内容。
-- 建议通过 GitHub Releases 分发 `WT-DGLAB.exe`，不要要求普通用户从源码构建。
-
 ## 相关资料
 
 - [战争雷霆 localhost:8111 文档](https://github.com/lucasvmx/WarThunder-localhost-documentation)
