@@ -17,7 +17,7 @@ def build():
     """运行 PyInstaller 打包"""
     project_root = os.path.dirname(os.path.abspath(__file__))
     main_script = os.path.join(project_root, "main.py")
-    icon_path = os.path.join(project_root, "icon.ico")
+    icon_path = os.path.join(project_root, "tubiao.ico")
 
     # PyInstaller 参数
     cmd = [
@@ -28,20 +28,20 @@ def build():
         "--distpath", ".",       # 直接输出到项目根目录
         "--add-data", f"src{os.pathsep}src",
         "--add-data", f"注意事项.txt{os.pathsep}.",
+        "--add-data", f"tubiao_ui.jpg{os.pathsep}.",
+        "--add-data", f"tubiao.ico{os.pathsep}.",
+        "--collect-all", "PySide6",
         "--hidden-import", "pydglab_ws",
         "--hidden-import", "qrcode",
         "--hidden-import", "PIL",
         "--hidden-import", "requests",
         "--hidden-import", "websockets",
-        "--hidden-import", "PIL.ImageTk",
         "--clean",
         "--noconfirm",
         main_script,
     ]
 
-    # 如果有图标文件则加上
-    if os.path.exists(icon_path):
-        cmd.insert(-1, f"--icon={icon_path}")
+    cmd.insert(-1, f"--icon={icon_path}")
 
     print("=" * 60)
     print("  WT-DGLAB 打包脚本")

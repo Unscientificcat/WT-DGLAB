@@ -1,176 +1,162 @@
-"""悬浮窗模块 — 透明置顶窗口，显示实时游戏数据
+"""PySide6 悬浮窗，显示实时游戏数据。"""
 
-左键拖动移动，右键菜单切换大小。
-"""
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtGui import QAction
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QMenu, QVBoxLayout, QWidget
 
-import tkinter as tk
-from tkinter import Menu
 
-# 大小预设
 SIZES = {
-    "大": {"value": 36, "channel": 18, "mode": 14},
-    "中": {"value": 24, "channel": 14, "mode": 11},
-    "小": {"value": 16, "channel": 11, "mode": 9},
+    "大": {"value": 40, "channel": 20, "mode": 15},
+    "中": {"value": 26, "channel": 14, "mode": 11},
+    "小": {"value": 19, "channel": 12, "mode": 10},
 }
 
 
-class OverlayWindow:
-    """悬浮窗 — 透明背景，始终置顶"""
+class OverlayWindow(QWidget):
+    """透明置顶悬浮窗，支持拖动和右键切换大小。"""
 
     def __init__(self):
+        super().__init__(None)
+        self.setObjectName("overlayWindow")
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
         self._size = "中"
         self._visible = False
-        # 逐字段缓存，避免未变化的标签被重复 config() 导致闪烁
-        self._cache_mode = ""
-        self._cache_value = ""
-        self._cache_unit = ""
-        self._cache_cha = ""
-        self._cache_chb = ""
-        self._cache_event = ""
+        self._drag_offset = QPoint()
+        self._cache = {"mode": "", "value": "", "unit": "", "a": "", "b": "", "event": ""}
+        self._build()
+        self.move(100, 100)
+        self.hide()
 
-        self.win = tk.Toplevel()
-        self.win.overrideredirect(True)
-        self.win.wm_attributes("-topmost", True)
-        self.win.wm_attributes("-transparentcolor", "#010101")  # 独特色，不与文字边缘重合
-        self.win.configure(bg="#010101")
-        self.win.withdraw()
+    def _build(self) -> None:
+        """创建悬浮窗控件。"""
+        root = QFrame()
+        root.setObjectName("overlaySurface")
+        root.setAttribute(Qt.WA_TranslucentBackground)
+        root.setAutoFillBackground(False)
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(1)
 
-        # === 内容框架 ===
-        frame = tk.Frame(self.win, bg="#010101")
-        frame.pack(padx=8, pady=4)
+        self.mode_label = QLabel("空战")
+        self.mode_label.setObjectName("overlayMode")
+        self.value_label = QLabel("--.-")
+        self.value_label.setObjectName("overlayValue")
+        self.unit_label = QLabel("G")
+        self.unit_label.setObjectName("hintText")
+        self.a_label = QLabel("A: 0")
+        self.a_label.setObjectName("overlayA")
+        self.b_label = QLabel("B: 0")
+        self.b_label.setObjectName("overlayB")
+        self.event_label = QLabel("")
+        self.event_label.setObjectName("eventText")
 
-        self.mode_label = tk.Label(
-            frame, text="空战", fg="#4A90D9", bg="#010101",
-            font=("Microsoft YaHei", 11, "bold"))
-        self.mode_label.pack(anchor=tk.W)
+        channels = QHBoxLayout()
+        channels.setContentsMargins(0, 4, 0, 0)
+        channels.addWidget(self.a_label)
+        channels.addSpacing(12)
+        channels.addWidget(self.b_label)
+        channels.addStretch()
 
-        self.value_label = tk.Label(
-            frame, text="--.-", fg="white", bg="#010101",
-            font=("Microsoft YaHei", 24, "bold"))
-        self.value_label.pack(anchor=tk.W)
+        layout.addWidget(self.mode_label)
+        layout.addWidget(self.value_label)
+        layout.addWidget(self.unit_label)
+        layout.addLayout(channels)
+        layout.addWidget(self.event_label)
 
-        self.unit_label = tk.Label(
-            frame, text="G", fg="#AAAAAA", bg="#010101",
-            font=("Microsoft YaHei", 12))
-        self.unit_label.pack(anchor=tk.W)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(root)
+        self.set_size(self._size)
 
-        tk.Frame(frame, bg="#333333", height=1).pack(fill=tk.X, pady=2)
-
-        self.ch_a_label = tk.Label(
-            frame, text="A: 0", fg="#FF6666", bg="#010101",
-            font=("Microsoft YaHei", 14, "bold"))
-        self.ch_a_label.pack(anchor=tk.W)
-
-        self.ch_b_label = tk.Label(
-            frame, text="B: 0", fg="#66BBFF", bg="#010101",
-            font=("Microsoft YaHei", 14, "bold"))
-        self.ch_b_label.pack(anchor=tk.W)
-
-        # === 事件标签 ===
-        self.event_label = tk.Label(
-            frame, text="", fg="#FFD700", bg="#010101",
-            font=("Microsoft YaHei", 11, "bold"))
-        self.event_label.pack(anchor=tk.W)
-
-        # === 拖动绑定 ===
-        self._drag_x = 0
-        self._drag_y = 0
-        frame.bind("<Button-1>", self._start_drag)
-        frame.bind("<B1-Motion>", self._do_drag)
-        # 所有标签也能拖动
-        for child in [self.mode_label, self.value_label, self.unit_label,
-                      self.ch_a_label, self.ch_b_label, self.event_label]:
-            child.bind("<Button-1>", self._start_drag)
-            child.bind("<B1-Motion>", self._do_drag)
-
-        # === 右键菜单 ===
-        self._menu = Menu(self.win, tearoff=0)
-        self._menu.add_command(label="大", command=lambda: self.set_size("大"))
-        self._menu.add_command(label="中", command=lambda: self.set_size("中"))
-        self._menu.add_command(label="小", command=lambda: self.set_size("小"))
-        frame.bind("<Button-3>", lambda e: self._menu.post(e.x_root, e.y_root))
-        for child in [self.mode_label, self.value_label, self.unit_label,
-                      self.ch_a_label, self.ch_b_label, self.event_label]:
-            child.bind("<Button-3>",
-                       lambda e: self._menu.post(e.x_root, e.y_root))
-
-        # 默认位置
-        self.win.geometry("+100+100")
-
-    def show(self):
-        """显示悬浮窗"""
+    def show(self) -> None:
+        """显示悬浮窗并清除显示缓存。"""
         self._visible = True
-        self._cache_mode = ""
-        self._cache_value = ""
-        self._cache_unit = ""
-        self._cache_cha = ""
-        self._cache_chb = ""
-        self._cache_event = ""
-        self.win.deiconify()
+        self._cache = {key: "" for key in self._cache}
+        super().show()
 
-    def hide(self):
-        """隐藏悬浮窗"""
+    def hide(self) -> None:
+        """隐藏悬浮窗。"""
         self._visible = False
-        self.win.withdraw()
+        super().hide()
 
     @property
     def visible(self) -> bool:
+        """返回悬浮窗是否显示。"""
         return self._visible
 
-    def set_size(self, size: str):
-        """切换大小"""
+    def set_size(self, size: str) -> None:
+        """更新悬浮窗字号预设。"""
         if size not in SIZES:
             return
         self._size = size
-        cfg = SIZES[size]
-        self.value_label.config(font=("Microsoft YaHei", cfg["value"], "bold"))
-        self.ch_a_label.config(font=("Microsoft YaHei", cfg["channel"], "bold"))
-        self.ch_b_label.config(font=("Microsoft YaHei", cfg["channel"], "bold"))
-        self.mode_label.config(font=("Microsoft YaHei", cfg["mode"], "bold"))
-        self.unit_label.config(font=("Microsoft YaHei", cfg["mode"]))
-        self.event_label.config(font=("Microsoft YaHei", cfg["mode"], "bold"))
+        preset = SIZES[size]
+        self.value_label.setStyleSheet(f"font-size:{preset['value']}px;")
+        for label in (self.a_label, self.b_label):
+            label.setStyleSheet(f"font-size:{preset['channel']}px;")
+        for label in (self.mode_label, self.unit_label, self.event_label):
+            label.setStyleSheet(f"font-size:{preset['mode']}px;")
+        self.adjustSize()
 
     def get_size(self) -> str:
+        """返回当前悬浮窗大小。"""
         return self._size
 
-    def update(self, mode: str, value: str, unit: str,
-               ch_a: int, ch_b: int, event_text: str = ""):
-        """同步数据到悬浮窗 — 逐字段对比，只更新真正变化的部分"""
-        if not self._visible:
+    def update(self, mode: str, value: str, unit: str, ch_a: int, ch_b: int,
+               event_text: str = "") -> None:
+        """仅更新发生变化的实时字段，减少重绘。"""
+        values = {
+            "mode": "空战" if mode == "aircraft" else "陆战",
+            "value": value,
+            "unit": unit,
+            "a": f"A: {ch_a}",
+            "b": f"B: {ch_b}",
+            "event": event_text,
+        }
+        labels = {
+            "mode": self.mode_label,
+            "value": self.value_label,
+            "unit": self.unit_label,
+            "a": self.a_label,
+            "b": self.b_label,
+            "event": self.event_label,
+        }
+        for key, text in values.items():
+            if text != self._cache[key]:
+                self._cache[key] = text
+                labels[key].setText(text)
+
+    def destroy(self) -> None:
+        """关闭并释放悬浮窗。"""
+        self._visible = False
+        self.close()
+        self.deleteLater()
+
+    def mousePressEvent(self, event) -> None:
+        """记录左键拖动起点，或显示右键菜单。"""
+        if event.button() == Qt.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
             return
+        if event.button() == Qt.RightButton:
+            menu = QMenu(self)
+            for size in ("大", "中", "小"):
+                action = QAction(size, menu)
+                action.setCheckable(True)
+                action.setChecked(size == self._size)
+                action.triggered.connect(lambda checked=False, value=size: self.set_size(value))
+                menu.addAction(action)
+            menu.exec(event.globalPosition().toPoint())
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
-        mode_text = "空战" if mode == "aircraft" else "陆战"
-        ch_a_text = f"A: {ch_a}"
-        ch_b_text = f"B: {ch_b}"
-
-        # 每个字段独立对比缓存，只更新变了的部分
-        if mode_text != self._cache_mode:
-            self._cache_mode = mode_text
-            self.mode_label.config(text=mode_text)
-        if value != self._cache_value:
-            self._cache_value = value
-            self.value_label.config(text=value)
-        if unit != self._cache_unit:
-            self._cache_unit = unit
-            self.unit_label.config(text=unit)
-        if ch_a_text != self._cache_cha:
-            self._cache_cha = ch_a_text
-            self.ch_a_label.config(text=ch_a_text)
-        if ch_b_text != self._cache_chb:
-            self._cache_chb = ch_b_text
-            self.ch_b_label.config(text=ch_b_text)
-        if event_text != self._cache_event:
-            self._cache_event = event_text
-            self.event_label.config(text=event_text)
-
-    def destroy(self):
-        self.win.destroy()
-
-    def _start_drag(self, event):
-        self._drag_x = event.x_root - self.win.winfo_x()
-        self._drag_y = event.y_root - self.win.winfo_y()
-
-    def _do_drag(self, event):
-        x = event.x_root - self._drag_x
-        y = event.y_root - self._drag_y
-        self.win.geometry(f"+{x}+{y}")
+    def mouseMoveEvent(self, event) -> None:
+        """拖动悬浮窗。"""
+        if event.buttons() & Qt.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)

@@ -1,12 +1,12 @@
-"""郊狼雷霆 v0.1 — 战争雷霆 × 郊狼 3.0 电击联动
+"""郊狼雷霆 v1 beta — 战争雷霆 × 郊狼 3.0 电击联动
 
 启动方式：
     python main.py
 
 架构：
-    战争雷霆 :8111 ──HTTP──► GameReader ──► MappingEngine ──► CoyoteController ──WS──► 手机App ──BLE──► 郊狼3.0
+    战争雷霆 :8111 ──HTTP──► GameReader ──► MappingEngine ──► V3/V4 Controller ──WS──► 手机App ──BLE──► 郊狼
                                                         │
-                                                    MainWindow (tkinter GUI)
+                                                    MainWindow (PySide6 GUI)
 """
 
 import sys
@@ -19,16 +19,17 @@ import queue
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import qrcode
-from PIL import Image, ImageTk
+from PIL import Image
 
 from src.config_manager import ConfigManager
+from src.event_detector import EventDetector
 from src.game_reader import GameReader, GameState
 from src.coyote_controller import CoyoteController
+from src.coyote_v4_controller import CoyoteV4Controller
 from src.mapping_engine import MappingEngine
 from src.gui.disclaimer_dialog import show_disclaimer_dialog
 from src.gui.main_window import MainWindow
 from src.gui.overlay import OverlayWindow
-from src.gui.styles import COLORS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,15 +53,13 @@ class App:
         self._last_state = GameState()
         self._coyote_started = False
 
-        # 事件检测状态
-        self._last_dmg_id = 0
+        # 事件输出状态
         self._event_kind = ""       # "" / "kill" / "death"
         self._event_mode = ""       # "aircraft" / "tank"
         self._event_ch_a = 0
         self._event_ch_b = 0
         self._event_remaining = 0.0  # 剩余秒数
         self._current_mode = self._cfg.app.mode
-        self._repair_active = False
         self._wt_fail_count = 0
         self._wt_connected = False
         self._overlay_tick = 0                      # 悬浮窗节流计数
@@ -75,6 +74,9 @@ class App:
 
         # ===== 悬浮窗 =====
         self.overlay = OverlayWindow()
+        self.window.dashboard.set_overlay_callback(
+            self._apply_overlay_settings
+        )
         if self._cfg.app.overlay_enabled:
             self.overlay.show()
             self.overlay.set_size(self._cfg.app.overlay_size)
@@ -84,13 +86,17 @@ class App:
 
         # ===== 游戏数据读取器 =====
         self.game_reader = GameReader()
+        self.event_detector = EventDetector(self.game_reader)
 
         # ===== 郊狼控制器 =====
-        self.coyote = CoyoteController(port=self._cfg.app.ws_port)
+        self._coyote_protocol = self._cfg.app.dglab_protocol
+        self.coyote = self._create_coyote_controller()
 
         # ===== 线程间通信 =====
         self._data_queue = queue.Queue(maxsize=2)  # 只保留最新游戏数据
         self._event_queue = queue.Queue(maxsize=2)  # 最新事件数据
+        self._coyote_start_queue = queue.Queue(maxsize=2)
+        self._coyote_starting = False
         self._running = True
 
     @property
@@ -104,9 +110,12 @@ class App:
 
     def run(self):
         """启动应用"""
-        # 每次启动显示注意事项
-        if not self._show_disclaimer_dialog():
-            return  # 用户关闭对话框则退出
+        # 首次启动显示注意事项
+        if not self._cfg.app.notice_accepted:
+            if not self._show_disclaimer_dialog():
+                return  # 用户关闭对话框则退出
+            self._cfg.app.notice_accepted = True
+            self.config_mgr.save()
 
         # 启动游戏数据后台线程
         self._poller_thread = threading.Thread(
@@ -121,22 +130,24 @@ class App:
         self._schedule_ui_refresh()
 
         # 窗口关闭时清理
-        self.window.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.window.set_close_callback(self._on_close)
 
-        # 进入 tkinter 主循环
+        # 进入 Qt 主循环
         self.window.run()
 
     def _on_close(self):
         """窗口关闭回调 — 立即关闭，不等待后台资源释放"""
         self._running = False
+        self.coyote.clear_all()
+        self.coyote.stop()
         self.overlay.destroy()
-        self.window.root.destroy()
+        self.window.quit()
 
     def _show_disclaimer_dialog(self) -> bool:
         """每次启动显示注意事项对话框。返回 True 表示确认，False 表示关闭。"""
-        confirmed = show_disclaimer_dialog(self.window.root)
+        confirmed = show_disclaimer_dialog(self.window)
         if not confirmed:
-            self.window.root.destroy()
+            self.window.quit()
         return confirmed
 
     # ============================================================
@@ -161,21 +172,7 @@ class App:
                 except queue.Empty:
                     pass
 
-            # 事件检测（后台执行，不阻塞主线程）
-            try:
-                events = self._detect_events()
-                if events:
-                    logger.info(f"检测到事件: {events['kind']} mode={events.get('mode','')}")
-                    try:
-                        self._event_queue.put(events, block=False)
-                    except queue.Full:
-                        try:
-                            self._event_queue.get_nowait()
-                            self._event_queue.put(events, block=False)
-                        except queue.Empty:
-                            pass
-            except Exception as e:
-                logger.warning(f"事件检测异常: {e}", exc_info=True)
+            self._poll_events(state)
 
             # 等待下一次轮询
             self._running_event = threading.Event()
@@ -183,90 +180,31 @@ class App:
                 max(self._cfg.app.refresh_interval_ms / 1000.0, 0.05)
             )
 
-    def _detect_events(self) -> dict:
-        """后台线程中检测事件（不阻塞主线程）
+    def _poll_events(self, state: GameState) -> None:
+        """调用独立检测器，并将新事件放入主线程队列。"""
+        try:
+            event = self.event_detector.poll(
+                state,
+                self._current_mode,
+                self._cfg.events,
+                self._cfg.tank_events,
+            )
+            if not event:
+                return
 
-        根据游戏内实际载具类型选择事件配置，而非 GUI 模式。
-        这样陆战上飞机时用空战事件，在地面时用陆战事件。
-        """
-        # 优先用游戏实际载具类型，未知时回退到 GUI 模式
-        vt = self._last_state.vehicle_type or self._current_mode
-        if vt == "aircraft":
-            ev_cfg = self._cfg.events
-        elif vt == "tank":
-            ev_cfg = self._cfg.tank_events
-        else:
-            return {}
-
-        result = {}
-
-        # 维修检测（不需要昵称，基于游戏状态）
-        if vt == "tank" and ev_cfg.repair_enabled:
-            tank = self._last_state.tank
-            if tank and tank.is_repairing and not self._repair_active:
-                self._repair_active = True
-                result = {
-                    "kind": "repair", "mode": vt,
-                    "ch_a": ev_cfg.repair_ch_a, "ch_b": ev_cfg.repair_ch_b,
-                    "duration": 60,
-                    "wf_a": ev_cfg.repair_wf_a, "wf_b": ev_cfg.repair_wf_b,
-                }
-
-        # 击杀/死亡检测（需要昵称匹配 hudmsg）
-        if ev_cfg.player_name:
-            result = self._detect_kill_death(ev_cfg, vt) or result
-
-        return result
-
-    def _detect_kill_death(self, ev_cfg, mode: str) -> dict:
-        """检测 hudmsg 击杀/死亡事件"""
-        name = ev_cfg.player_name
-        records = self.game_reader.fetch_hudmsg(self._last_dmg_id)
-        if records:
-            logger.debug(f"hudmsg: 获取 {len(records)} 条新记录, last_id={self._last_dmg_id}, name={name}")
-        result = {}
-        ZERO_WIDTH = set("​‌‍‎‏⁠﻿")
-        for r in records:
-            rid = int(r.get("id", 0))
-            if rid > self._last_dmg_id:
-                self._last_dmg_id = rid
-
-            msg = r.get("msg", "")
-            msg = "".join(c for c in msg if c not in ZERO_WIDTH)
-            if name not in msg:
-                continue
-
-            is_kill = False
-            for kw in ["击落了", "击毁了"]:
-                if kw in msg and name in msg.split(kw, 1)[0]:
-                    is_kill = True
-                    break
-
-            is_killed = False
-            for kw in ["击落了", "击毁了"]:
-                if kw in msg:
-                    if name in msg.split(kw, 1)[1]:
-                        is_killed = True
-                        break
-            if not is_killed and name in msg and "已坠毁" in msg:
-                is_killed = True
-
-            if is_kill and ev_cfg.kill_enabled:
-                result = {
-                    "kind": "kill", "mode": mode,
-                    "ch_a": ev_cfg.kill_ch_a, "ch_b": ev_cfg.kill_ch_b,
-                    "duration": ev_cfg.kill_duration,
-                    "wf_a": ev_cfg.kill_wf_a, "wf_b": ev_cfg.kill_wf_b,
-                }
-            elif is_killed and ev_cfg.death_enabled:
-                result = {
-                    "kind": "death", "mode": mode,
-                    "ch_a": ev_cfg.death_ch_a, "ch_b": ev_cfg.death_ch_b,
-                    "duration": ev_cfg.death_duration,
-                    "wf_a": ev_cfg.death_wf_a, "wf_b": ev_cfg.death_wf_b,
-                }
-
-        return result
+            logger.info(
+                f"检测到事件: {event['kind']} mode={event.get('mode', '')}"
+            )
+            try:
+                self._event_queue.put(event, block=False)
+            except queue.Full:
+                try:
+                    self._event_queue.get_nowait()
+                    self._event_queue.put(event, block=False)
+                except queue.Empty:
+                    pass
+        except Exception as error:
+            logger.warning(f"事件检测异常: {error}", exc_info=True)
 
     # ============================================================
     # 主线程：UI 刷新（流畅，不阻塞）
@@ -278,121 +216,68 @@ class App:
 
     def _ui_tick(self):
         """主线程定时器 — 检查数据队列并更新 UI"""
-        # 1. 取后台检测的事件
         try:
-            while True:
-                ev = self._event_queue.get_nowait()
-                if ev:
-                    self._apply_event(ev)
-        except queue.Empty:
-            pass
+            # 1. 取后台检测的事件
+            try:
+                while True:
+                    event = self._event_queue.get_nowait()
+                    if event:
+                        self._apply_event(event)
+            except queue.Empty:
+                pass
 
-        # 2. 取最新游戏数据
-        state = None
-        try:
-            while True:
-                state = self._data_queue.get_nowait()
-        except queue.Empty:
-            pass
+            # 2. 取最新游戏数据
+            state = None
+            try:
+                while True:
+                    state = self._data_queue.get_nowait()
+            except queue.Empty:
+                pass
 
-        # 3. 应用强度（事件或正常映射）
-        if state is not None or self._event_remaining > 0:
-            self._apply_game_state(state or GameState())
+            # 3. 应用强度（事件或正常映射）
+            if state is not None:
+                self._apply_game_state(state)
+            elif self._event_remaining > 0:
+                # 事件可能先于下一帧遥测入队。此时复用最后一份已验证状态，
+                # 不能构造空状态，否则会被安全归零分支误判为离开对局。
+                self._apply_game_state(self._last_state)
 
-        # 4. 事件倒计时
-        if self._event_remaining > 0:
-            self._event_remaining -= 0.1
-            # 维修事件：检查是否还在维修中
-            if self._event_kind == "repair" and self._last_state.tank and not self._last_state.tank.is_repairing:
-                self._event_remaining = 0
-                self._repair_active = False
-            if self._event_remaining <= 0:
-                self._event_remaining = 0
-                self._event_kind = ""
-                self._repair_active = False
-                self.window.dashboard.show_event("")
-                self._apply_waveform()
-                logger.info("事件结束，恢复正常映射")
-            else:
-                if self._event_kind == "repair":
+            # 4. 事件倒计时
+            if self._event_remaining > 0:
+                self._event_remaining -= 0.1
+                # 维修事件：检查是否还在维修中
+                if (self._event_kind == "repair" and self._last_state.tank
+                        and not self._last_state.tank.is_repairing):
+                    self._event_remaining = 0
+                if self._event_remaining <= 0:
+                    self._event_remaining = 0
+                    self._event_kind = ""
+                    self.window.dashboard.show_event("")
+                    self._apply_waveform()
+                    logger.info("事件结束，恢复正常映射")
+                elif self._event_kind == "repair":
                     self.window.dashboard.show_event("🔧 维修中")
                 elif self._event_kind == "kill":
-                    self.window.dashboard.show_event(f"⚔ 击杀! ({self._event_remaining:.1f}s)")
+                    self.window.dashboard.show_event(
+                        f"⚔ 击杀! ({self._event_remaining:.1f}s)"
+                    )
                 else:
-                    self.window.dashboard.show_event(f"💀 坠毁!" if self._event_mode == "aircraft" else f"💀 被摧毁! ({self._event_remaining:.1f}s)")
+                    text = (
+                        "💀 坠毁!"
+                        if self._event_mode == "aircraft"
+                        else f"💀 被摧毁! ({self._event_remaining:.1f}s)"
+                    )
+                    self.window.dashboard.show_event(text)
 
-        # 5. 更新郊狼状态
-        self._update_coyote_status()
-
-        # 6. 继续
-        self._schedule_ui_refresh()
-
-    def _check_events(self):
-        """检查 /hudmsg 新记录，检测击杀/死亡事件"""
-        mode = self.window.get_mode()
-        if mode == "aircraft":
-            ev_cfg = self._cfg.events
-        elif mode == "tank":
-            ev_cfg = self._cfg.tank_events
-        else:
-            return
-        if not ev_cfg.player_name:
-            return
-
-        name = ev_cfg.player_name
-        records = self.game_reader.fetch_hudmsg(self._last_dmg_id)
-
-        for r in records:
-            rid = int(r.get("id", 0))
-            if rid > self._last_dmg_id:
-                self._last_dmg_id = rid
-
-            msg = r.get("msg", "")
-            # 清理 Unicode 零宽字符（战争雷霆消息中夹杂 ​ 导致匹配失败）
-            ZERO_WIDTH = set("​‌‍‎‏⁠﻿")
-            msg = "".join(c for c in msg if c not in ZERO_WIDTH)
-
-            # 检测击杀：名字在"击落"/"击毁"前面（中间可能有载具名）
-            is_kill = False
-            for kw in ["击落了", "击毁了"]:
-                if kw in msg and name in msg.split(kw, 1)[0]:
-                    is_kill = True
-                    break
-
-            # 检测被击落：玩家名出现在"击落"/"击毁"后面
-            is_killed = False
-            for kw in ["击落了", "击毁了"]:
-                if kw in msg:
-                    if name in msg.split(kw, 1)[1]:
-                        is_killed = True
-                        break
-            # 检测坠毁：玩家名 + 可能有载具名 + "已坠毁"
-            if not is_killed and name in msg and "已坠毁" in msg:
-                is_killed = True
-
-            if is_kill and ev_cfg.kill_enabled:
-                self._event_kind = "kill"
-                self._event_mode = mode
-                self._event_ch_a = ev_cfg.kill_ch_a
-                self._event_ch_b = ev_cfg.kill_ch_b
-                self._event_remaining = ev_cfg.kill_duration
-                self.coyote.set_waveform_a(ev_cfg.kill_wf_a)
-                self.coyote.set_waveform_b(ev_cfg.kill_wf_b)
-                logger.info(f"击杀检测! A={self._event_ch_a} B={self._event_ch_b} 持续={self._event_remaining}s")
-                self.window.dashboard.show_event(
-                    f"⚔ 击杀! ({self._event_remaining:.1f}s)")
-
-            elif is_killed and ev_cfg.death_enabled:
-                self._event_kind = "death"
-                self._event_mode = mode
-                self._event_ch_a = ev_cfg.death_ch_a
-                self._event_ch_b = ev_cfg.death_ch_b
-                self._event_remaining = ev_cfg.death_duration
-                self.coyote.set_waveform_a(ev_cfg.death_wf_a)
-                self.coyote.set_waveform_b(ev_cfg.death_wf_b)
-                logger.info(f"被击落检测! A={self._event_ch_a} B={self._event_ch_b} 持续={self._event_remaining}s")
-                self.window.dashboard.show_event(
-                    f"💀 被击落! ({self._event_remaining:.1f}s)")
+            # 5. 更新郊狼状态
+            self._process_coyote_start_result()
+            self._update_coyote_status()
+        except Exception as error:
+            logger.error(f"UI 刷新异常: {error}", exc_info=True)
+        finally:
+            # 即使显示分支异常，仍保持 UI 定时器存活。
+            if self._running:
+                self._schedule_ui_refresh()
 
     def _apply_game_state(self, state: GameState):
         """将游戏状态应用到 UI 和郊狼设备"""
@@ -412,10 +297,16 @@ class App:
                 self._wt_connected = False
                 self.window.status_bar.set_wt_status(False)
 
-        if not state.connected and self._event_remaining <= 0:
-            self.window.dashboard.clear(mode)
+        # 未确认仍在有效对局时，所有可能残留的 8111 指标都不可信。
+        # 此处不使用连接状态防抖，避免退出对局后仍持续数个轮询周期的输出。
+        if not state.connected:
             if self.coyote.status.bound:
                 self._send_strength(0, 0)
+            self._cancel_active_event()
+            self.window.dashboard.clear(mode)
+            self._overlay_last_value = ""
+            self._overlay_last_unit = ""
+            self._sync_overlay(mode, 0, 0)
             return
 
         intensity_a = 0
@@ -431,12 +322,9 @@ class App:
                 label = "💀 坠毁!" if self._event_mode == "aircraft" else "💀 被摧毁!"
             else:
                 label = "🔧 维修中"
-            self.window.dashboard.value_label.config(text=label)
-            self.window.dashboard.unit_label.config(text="")
-            self.window.dashboard.ch_a_label.config(
-                text=f"A通道: {intensity_a}")
-            self.window.dashboard.ch_b_label.config(
-                text=f"B通道: {intensity_b}")
+            self.window.dashboard.update_event(
+                label, intensity_a, intensity_b
+            )
 
         elif mode == "aircraft" and state.aircraft and state.aircraft.valid:
             ac = state.aircraft
@@ -492,6 +380,20 @@ class App:
             self._overlay_tick = 0
             self._sync_overlay(mode, intensity_a, intensity_b)
 
+    def _cancel_active_event(self):
+        """在离开有效对局时取消事件覆盖，避免事件强度继续输出。"""
+        had_event = self._event_remaining > 0 or bool(self._event_kind)
+        self._event_kind = ""
+        self._event_mode = ""
+        self._event_ch_a = 0
+        self._event_ch_b = 0
+        self._event_remaining = 0.0
+        self.window.dashboard.show_event("")
+
+        if had_event:
+            self._apply_waveform()
+            logger.info("已离开有效对局，取消事件输出并恢复常规波形")
+
     def _apply_event(self, ev: dict):
         """应用后台检测到的事件"""
         self._event_kind = ev["kind"]
@@ -515,6 +417,8 @@ class App:
 
     def _on_mode_switched(self):
         """模式切换/设置保存回调 — 刷新仪表盘 + 同步波形"""
+        if hasattr(self, "coyote"):
+            self._switch_coyote_protocol_if_needed()
         if self._window_ready:
             self._current_mode = self.window.get_mode()
         else:
@@ -530,46 +434,89 @@ class App:
     def _update_coyote_status(self):
         """同步郊狼状态到 UI"""
         status = self.coyote.status
+        if (self._coyote_protocol == "v4" and self._coyote_started
+                and not self._coyote_starting
+                and not status.server_running):
+            self._coyote_started = False
+            self.window.after(5000, self._start_coyote)
         self.window.status_bar.set_coyote_status(
             status.bound,
             status.address if status.bound else ""
         )
         if status.bound:
-            self.window.qr_widget.set_status("✓ 已连接，电击输出中")
+            self.window.qr_widget.set_status("✓ 已连接")
         elif status.server_running:
-            self.window.qr_widget.set_status("等待手机扫码连接...",
-                                             status.address)
+            if self._coyote_protocol == "v4" and status.client_connected:
+                text = "App 已接入，等待郊狼设备..."
+            else:
+                text = "等待手机扫码连接..."
+            self.window.qr_widget.set_status(text, status.address)
         else:
-            self.window.qr_widget.set_status("WebSocket 服务启动中...")
+            text = (
+                "正在连接 V4 Relay..."
+                if self._coyote_protocol == "v4"
+                else "WebSocket 服务启动中..."
+            )
+            if status.error:
+                text = f"⚠ {status.error}"
+            self.window.qr_widget.set_status(text)
 
     # ============================================================
     # 郊狼控制
     # ============================================================
 
+    def _create_coyote_controller(self):
+        """按当前配置创建 V3 或 V4 控制器。"""
+        if self._cfg.app.dglab_protocol == "v4":
+            return CoyoteV4Controller(self._cfg.app.v4_relay_url)
+        return CoyoteController(port=self._cfg.app.ws_port)
+
+    def _switch_coyote_protocol_if_needed(self) -> None:
+        """设置保存后按需重建郊狼连接控制器。"""
+        desired = self._cfg.app.dglab_protocol
+        connection_changed = desired != self._coyote_protocol
+        if desired == "v3" and isinstance(self.coyote, CoyoteController):
+            connection_changed = connection_changed or (
+                self.coyote.port != self._cfg.app.ws_port
+            )
+        elif desired == "v4" and isinstance(
+                self.coyote, CoyoteV4Controller):
+            connection_changed = connection_changed or (
+                self.coyote.relay_url
+                != CoyoteV4Controller.normalize_relay_url(
+                    self._cfg.app.v4_relay_url
+                )
+            )
+
+        if not connection_changed:
+            return
+
+        logger.info(f"切换 DG-LAB 连接协议: {self._coyote_protocol} -> {desired}")
+        self.coyote.clear_all()
+        self.coyote.stop()
+        self._coyote_protocol = desired
+        self._coyote_started = False
+        self._coyote_starting = False
+        self.coyote = self._create_coyote_controller()
+        self.window.qr_widget.clear_qr_image()
+        self.window.after(200, self._start_coyote)
+
     def _sync_overlay(self, mode: str, intensity_a: int, intensity_b: int):
         """同步数据到悬浮窗"""
+        self._apply_overlay_settings()
         ov = self.overlay
-        want = self.window.dashboard.overlay_var.get()
-        if want != ov.visible:
-            if want:
-                ov.show()
-            else:
-                ov.hide()
-            self._cfg.app.overlay_enabled = want
-            self._cfg.app.overlay_size = self.window.overlay_size
-            self.config_mgr.save()
-        if ov.visible:
-            size = self.window.overlay_size
-            if size != ov.get_size():
-                ov.set_size(size)
-                self._cfg.app.overlay_size = size
-                self.config_mgr.save()
-
         if not ov.visible:
             return
 
         # 构建数据显示
         last = self._last_state
+        if not last.connected:
+            self._overlay_last_value = ""
+            self._overlay_last_unit = ""
+            unit = "G" if mode == "aircraft" else "km/h"
+            ov.update(mode, "--", unit, 0, 0, "")
+            return
+
         event_text = ""
         if self._event_remaining > 0:
             if self._event_kind == "repair":
@@ -604,6 +551,33 @@ class App:
         # 仅在值变化时更新（减少闪烁）
         ov.update(mode, value, unit, intensity_a, intensity_b, event_text)
 
+    def _apply_overlay_settings(self):
+        """立即应用悬浮窗开关和大小，并在变更时保存配置。"""
+        ov = self.overlay
+        want = self.window.dashboard.overlay_var.get()
+        size = self.window.overlay_size
+        changed = False
+
+        if want != ov.visible:
+            if want:
+                ov.show()
+            else:
+                ov.hide()
+            changed = True
+
+        if size != ov.get_size():
+            ov.set_size(size)
+            changed = True
+
+        if self._cfg.app.overlay_enabled != want:
+            self._cfg.app.overlay_enabled = want
+            changed = True
+        if self._cfg.app.overlay_size != size:
+            self._cfg.app.overlay_size = size
+            changed = True
+        if changed:
+            self.config_mgr.save()
+
     def _apply_waveform(self):
         """根据当前模式同步波形设置到郊狼"""
         mode = self.window.get_mode()
@@ -617,24 +591,63 @@ class App:
         self.coyote.set_waveform_b(cfg.waveform_b, cfg.random_interval)
 
     def _start_coyote(self):
-        """启动郊狼 WebSocket 服务端并生成 QR 码"""
-        if self._coyote_started:
+        """启动当前协议控制器并生成对应 App 配对二维码。"""
+        if self._coyote_started or self._coyote_starting:
             return
 
-        logger.info("正在启动郊狼 WebSocket 服务端...")
-        success = self.coyote.start()
+        label = "V4 Relay" if self._coyote_protocol == "v4" else "V3 服务端"
+        logger.info(f"正在启动郊狼 {label}...")
+        self._coyote_starting = True
+        controller = self.coyote
+        thread = threading.Thread(
+            target=self._start_coyote_worker,
+            args=(controller, label),
+            daemon=True,
+        )
+        thread.start()
+
+    def _start_coyote_worker(self, controller, label: str) -> None:
+        """在后台等待连接控制器启动，避免阻塞 Qt 主线程。"""
+        success = controller.start()
+        url = controller.get_qrcode_url() if success else ""
+        result = (controller, label, success, url, controller.status.error)
+        try:
+            self._coyote_start_queue.put(result, block=False)
+        except queue.Full:
+            pass
+
+    def _process_coyote_start_result(self) -> None:
+        """在 Qt 主线程应用后台连接结果。"""
+        if not hasattr(self, "_coyote_start_queue"):
+            return
+        try:
+            while True:
+                controller, label, success, url, error = (
+                    self._coyote_start_queue.get_nowait()
+                )
+                if controller is not self.coyote:
+                    controller.stop()
+                    continue
+                self._coyote_starting = False
+                self._finish_coyote_start(label, success, url, error)
+        except queue.Empty:
+            pass
+
+    def _finish_coyote_start(self, label: str, success: bool,
+                             url: str, error: str) -> None:
+        """更新二维码、状态提示和失败重试。"""
 
         if success:
             self._coyote_started = True
-            url = self.coyote.get_qrcode_url()
-            logger.info(f"服务端已启动: {url}")
+            logger.info(f"{label}已启动: {url}")
             self._generate_qr_image(url)
             self.window.qr_widget.set_status("等待手机扫码连接...", url)
             # 延迟同步波形设置（等绑定完成）
             self.window.after(3000, self._apply_waveform)
         else:
-            logger.error("郊狼服务端启动失败")
-            self.window.qr_widget.set_status("⚠ 服务启动失败，请检查端口")
+            logger.error(f"郊狼{label}启动失败: {error}")
+            message = error or "连接服务启动失败"
+            self.window.qr_widget.set_status(f"⚠ {message}")
             self.window.after(5000, self._start_coyote)
 
     def _generate_qr_image(self, url: str):
@@ -651,10 +664,7 @@ class App:
             img.save(buf, format="PNG")
             buf.seek(0)
             pil_img = Image.open(buf)
-            tk_img = ImageTk.PhotoImage(pil_img.resize((120, 120)))
-            self.window.qr_widget.qr_canvas.delete("all")
-            self.window.qr_widget.qr_canvas.create_image(60, 60, image=tk_img)
-            self.window.qr_widget._qr_image_ref = tk_img
+            self.window.qr_widget.set_qr_image(pil_img)
         except Exception as e:
             logger.error(f"QR 码生成失败: {e}")
 

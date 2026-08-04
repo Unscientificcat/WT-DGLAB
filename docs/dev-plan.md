@@ -15,7 +15,7 @@
 ### 阶段1：基础框架 ✅
 - [x] 创建项目目录结构
 - [x] 实现 ConfigManager（JSON 配置读写）
-- [x] 定义淡蓝色主题 tkinter ttk 样式
+- [x] 定义浅色 PySide6 / QSS 主题
 - [x] 实现 MainWindow 布局（状态栏+面板+QR区）
 - [x] 实现 SettingsPanel（所有参数设置控件）
 - [x] 实现 Dashboard（实时数据展示面板）
@@ -31,14 +31,18 @@
 - [x] 连接 Dashboard 实时显示
 - [x] auto-detect 载具类型
 - [x] 异常处理（WT未运行、超时、JSON解析失败）
+- [x] 独立 EventDetector（跨局 HUD 游标、击杀/死亡、维修边沿）
 
 ### 阶段3：郊狼控制模块 ✅
 - [x] 研究 DG-LAB Socket 协议（基于 PyDGLab-WS 库）
 - [x] 实现 WebSocket 服务端（asyncio 后台线程）
 - [x] 实现绑定/心跳/强度消息（由 PyDGLab-WS 封装）
-- [x] 实现 QR 码生成（qrcode + PIL → tkinter Canvas）
+- [x] 实现 QR 码生成（qrcode + PIL → Qt QPixmap）
 - [x] 线程安全通信（queue.Queue + asyncio.run_coroutine_threadsafe）
-- [ ] 连接测试（需要实际手机+郊狼设备 — 用户自行验证）
+- [x] V3/V4 App 用户选择、配置迁移和连接重建
+- [x] V4 Relay、官方二维码、设备快照、强度与波形控制
+- [x] V3 本机服务和 V4 官方 Relay 握手验证
+- [ ] V4 实际设备测试（需要 4.x App + 郊狼设备）
 
 ### 阶段4：映射引擎 ✅
 - [x] 实现 MappingEngine 线性映射
@@ -51,7 +55,9 @@
 - [x] 端到端模块集成（main.py App 类）
 - [x] 异常状态处理（WT未运行 → 零强度、设备断连 → 忽略指令）
 - [x] PyInstaller 打包脚本（build.py）
-- [ ] 实际 PyInstaller 打包（需用户执行 `pip install pyinstaller && python build.py`）
+- [x] 自动回归测试（34 项通过）
+- [x] 实际 PyInstaller 打包（`WT-DGLAB.exe`）
+- [x] 重写 GitHub README，并补充 `v1 beta` 相对 `v0.1` 的更新日志
 - [ ] 游戏内实测（需要战争雷霆 + 郊狼设备）
 
 ## 开发原则
@@ -61,7 +67,8 @@
 - 代码注释使用中文
 
 ## 技术方案（最终采用）
-- GUI: tkinter（Python 自带，0 MB）
-- 郊狼: pydglab-ws 库（封装协议细节）
+- GUI: PySide6（Qt 桌面界面，详见 `docs/ui-redesign.md`）
+- 郊狼 V3: pydglab-ws 本机服务端
+- 郊狼 V4: 按官方 V4 RPC 帧实现的 Relay 客户端
 - 游戏数据: requests 轮询 localhost:8111
 - 打包: PyInstaller → 单个 .exe

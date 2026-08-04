@@ -52,12 +52,13 @@ class TankData:
 @dataclass
 class GameState:
     """综合游戏状态"""
-    connected: bool = False          # WT 是否在运行且可连接
+    connected: bool = False          # 是否处于已确认的有效对局，可安全驱动输出
     vehicle_type: str = ""           # "aircraft" / "tank" / "" (未知)
     aircraft: Optional[AircraftData] = None
     tank: Optional[TankData] = None
     raw_state: dict = field(default_factory=dict)
     raw_indicators: dict = field(default_factory=dict)
+    raw_map_info: dict = field(default_factory=dict)
 
 
 # ============================================================
@@ -76,6 +77,7 @@ class GameReader:
 
     STATE_URL = "http://127.0.0.1:8111/state"
     INDICATORS_URL = "http://127.0.0.1:8111/indicators"
+    MAP_INFO_URL = "http://127.0.0.1:8111/map_info.json"
     HUDMSG_URL = "http://127.0.0.1:8111/hudmsg"
     TIMEOUT = 0.5  # 请求超时（秒），127.0.0.1 通常 <10ms
 
@@ -91,6 +93,11 @@ class GameReader:
         Returns:
             [{"id": N, "msg": "...", ...}, ...]  新 damage 记录列表
         """
+        _success, records = self.fetch_hudmsg_with_status(last_dmg_id)
+        return records
+
+    def fetch_hudmsg_with_status(self, last_dmg_id: int = 0) -> tuple[bool, list]:
+        """获取增量 HUD 记录，并区分空结果与请求失败。"""
         try:
             resp = requests.get(
                 self.HUDMSG_URL,
@@ -99,10 +106,11 @@ class GameReader:
             )
             if resp.status_code == 200:
                 data = resp.json()
-                return data.get("damage", [])
+                records = data.get("damage", [])
+                return True, records if isinstance(records, list) else []
         except Exception:
             pass
-        return []
+        return False, []
 
     def fetch(self) -> GameState:
         """获取一次游戏数据，返回 GameState
@@ -120,7 +128,20 @@ class GameReader:
                 requests.RequestException, json.JSONDecodeError):
             return state
 
-        # 标记已连接
+        # /indicators 会在退出对局后保留最后一帧数据，不能单独用于驱动设备。
+        # /map_info.json 在未处于对局时返回 {"valid": false}；有效对局则
+        # 返回 valid=true 或完整地图元数据。读取失败时按无效处理，优先保证归零。
+        try:
+            map_resp = self._session.get(self.MAP_INFO_URL,
+                                         timeout=self.TIMEOUT)
+            if map_resp.status_code == 200:
+                state.raw_map_info = map_resp.json()
+        except (requests.RequestException, json.JSONDecodeError):
+            pass
+
+        if not self._is_active_mission(state.raw_map_info):
+            return state
+
         state.connected = True
 
         # 同时获取 indicators（陆战中 state 可能为 {"valid": false}，但 indicators 有数据）
@@ -143,6 +164,26 @@ class GameReader:
             state.tank = self._parse_tank(state.raw_state, state.raw_indicators)
 
         return state
+
+    @staticmethod
+    def _is_active_mission(map_info_json: dict) -> bool:
+        """根据地图端点确认当前是否仍在有效对局中。
+
+        新版接口在无效时返回 ``{"valid": false}``，有效时通常返回
+        ``valid: true``。部分版本的有效响应不含 ``valid``，但会包含完整的
+        地图边界数据，因此也作为有效对局处理。
+        """
+        if not isinstance(map_info_json, dict):
+            return False
+
+        valid = map_info_json.get("valid")
+        if isinstance(valid, bool):
+            return valid
+
+        required_keys = {
+            "grid_steps", "grid_zero", "map_generation", "map_max", "map_min",
+        }
+        return required_keys.issubset(map_info_json)
 
     # ============================================================
     # 内部解析方法

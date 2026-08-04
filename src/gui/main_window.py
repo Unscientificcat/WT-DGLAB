@@ -1,789 +1,1189 @@
-"""主窗口 — 使用 tkinter 实现，包含状态栏、仪表盘、设置面板、QR 码区域"""
+"""PySide6 主窗口，包含实时状态、设置和设备连接区域。"""
 
-import tkinter as tk
-from tkinter import ttk
-from .styles import setup_styles, COLORS, FONTS
+import ctypes
+import os
+import sys
+from typing import Callable
+from urllib.parse import urlsplit
+
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QIcon, QImage, QPixmap
+from PySide6.QtWidgets import (
+    QApplication,
+    QButtonGroup,
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFormLayout,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSpinBox,
+    QSplitter,
+    QStackedWidget,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
+
 from .disclaimer_dialog import show_disclaimer_dialog
+from .styles import COLORS, setup_styles
 from ..config_manager import ConfigManager
+from ..waveforms import ALL_WAVEFORMS
 
 
-class StatusBar(ttk.Frame):
-    """顶部状态栏 — 显示战争雷霆和郊狼连接状态"""
+def _resource_path(filename: str) -> str:
+    """返回源码或 PyInstaller 环境中的资源文件路径。"""
+    if getattr(sys, "frozen", False):
+        root = sys._MEIPASS
+    else:
+        root = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..")
+        )
+    return os.path.join(root, filename)
 
-    def __init__(self, parent):
-        super().__init__(parent, style="StatusBar.TFrame")
+
+def _set_windows_app_id() -> None:
+    """为 Windows Shell 设置可区分旧版本的应用标识。"""
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "WT-DGLAB.v1-beta.tubiao"
+        )
+    except (AttributeError, OSError):
+        pass
+
+
+class ValueProxy:
+    """为旧主控制器保留 get/set 风格的轻量值接口。"""
+
+    def __init__(self, value, on_change: Callable | None = None):
+        self._value = value
+        self._on_change = on_change
+
+    def get(self):
+        """返回当前值。"""
+        return self._value
+
+    def set(self, value) -> None:
+        """设置值并同步关联控件。"""
+        if value == self._value:
+            return
+        self._value = value
+        if self._on_change:
+            self._on_change(value)
+
+
+class NoWheelSpinBox(QSpinBox):
+    """忽略滚轮，避免浏览设置页时误改整数参数。"""
+
+    def wheelEvent(self, event) -> None:
+        """将滚轮事件交还给外层滚动区域。"""
+        event.ignore()
+
+
+class NoWheelDoubleSpinBox(QDoubleSpinBox):
+    """忽略滚轮，避免浏览设置页时误改小数参数。"""
+
+    def wheelEvent(self, event) -> None:
+        """将滚轮事件交还给外层滚动区域。"""
+        event.ignore()
+
+
+class NoWheelComboBox(QComboBox):
+    """忽略滚轮，避免浏览设置页时误切换波形。"""
+
+    def wheelEvent(self, event) -> None:
+        """将滚轮事件交还给外层滚动区域。"""
+        event.ignore()
+
+
+class StatusPill(QFrame):
+    """单个连接状态指示控件。"""
+
+    def __init__(self, name: str):
+        super().__init__()
+        self.setObjectName("statusPill")
+        self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 7, 10, 7)
+        layout.setSpacing(6)
+
+        self.dot = QLabel("●")
+        self.dot.setObjectName("statusDot")
+        self.name_label = QLabel(name)
+        self.name_label.setObjectName("statusName")
+        self.value_label = QLabel("未连接")
+        self.value_label.setObjectName("statusValue")
+        layout.addWidget(self.dot)
+        layout.addWidget(self.name_label)
+        layout.addWidget(self.value_label)
+        self.set_connected(False)
+
+    def set_connected(self, connected: bool) -> None:
+        """更新状态文字和颜色。"""
+        color = COLORS["success"] if connected else COLORS["error"]
+        self.dot.setStyleSheet(f"color: {color};")
+        self.value_label.setText("已连接" if connected else "未连接")
+
+
+class StatusBar(QFrame):
+    """顶部状态栏，展示游戏和设备的连接状态。"""
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setObjectName("headerBar")
         self._build()
 
-    def _build(self):
-        # WT 状态指示灯 + 文字
-        self.wt_dot = tk.Label(self, text="●", fg=COLORS["error"],
-                               bg=COLORS["bg_card"], font=("Microsoft YaHei", 12))
-        self.wt_dot.pack(side=tk.LEFT, padx=(16, 4))
+    def _build(self) -> None:
+        """创建顶部状态栏内容。"""
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 10, 16, 10)
+        layout.setSpacing(10)
 
-        self.wt_label = tk.Label(self, text="WT: 未连接", fg=COLORS["text_primary"],
-                                 bg=COLORS["bg_card"], font=FONTS["small"])
-        self.wt_label.pack(side=tk.LEFT, padx=(0, 20))
+        self.brand_mark = QLabel()
+        self.brand_mark.setObjectName("brandMark")
+        self.brand_mark.setAlignment(Qt.AlignCenter)
+        cover = QPixmap(_resource_path("tubiao_ui.jpg"))
+        if not cover.isNull():
+            self.brand_mark.setPixmap(cover.scaled(
+                38,
+                38,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            ))
+        title_box = QVBoxLayout()
+        title_box.setSpacing(1)
+        title = QLabel("郊狼雷霆")
+        title.setObjectName("brandTitle")
+        subtitle = QLabel("WAR THUNDER × DG-LAB")
+        subtitle.setObjectName("brandSubtitle")
+        title_box.addWidget(title)
+        title_box.addWidget(subtitle)
 
-        # 分隔
-        ttk.Separator(self, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        self.wt_pill = StatusPill("战争雷霆")
+        self.dg_pill = StatusPill("郊狼设备")
+        self.address_label = QLabel("")
+        self.address_label.setObjectName("addressText")
+        self.address_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
-        # 郊狼状态
-        self.dg_dot = tk.Label(self, text="●", fg=COLORS["error"],
-                               bg=COLORS["bg_card"], font=("Microsoft YaHei", 12))
-        self.dg_dot.pack(side=tk.LEFT, padx=(8, 4))
+        self.disclaimer_button = QPushButton("注意事项")
+        self.disclaimer_button.setObjectName("textButton")
+        self.disclaimer_button.clicked.connect(
+            lambda: show_disclaimer_dialog(self.window())
+        )
 
-        self.dg_label = tk.Label(self, text="郊狼: 未连接", fg=COLORS["text_primary"],
-                                 bg=COLORS["bg_card"], font=FONTS["small"])
-        self.dg_label.pack(side=tk.LEFT, padx=(0, 20))
+        layout.addWidget(self.brand_mark)
+        layout.addLayout(title_box)
+        layout.addSpacing(18)
+        layout.addWidget(self.wt_pill)
+        layout.addWidget(self.dg_pill)
+        layout.addWidget(self.address_label, 1)
+        layout.addWidget(self.disclaimer_button)
 
-        # 地址信息（填充剩余空间）
-        self.addr_label = tk.Label(self, text="", fg=COLORS["text_secondary"],
-                                   bg=COLORS["bg_card"], font=FONTS["small"])
-        self.addr_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    def set_wt_status(self, connected: bool) -> None:
+        """更新战争雷霆连接状态。"""
+        self.wt_pill.set_connected(connected)
 
-        # 注意事项按钮
-        self.disclaimer_btn = tk.Label(self, text="注意事项", fg=COLORS["accent"],
-                                       bg=COLORS["bg_card"], font=FONTS["small"],
-                                       cursor="hand2")
-        self.disclaimer_btn.pack(side=tk.RIGHT, padx=(0, 16))
-        self.disclaimer_btn.bind("<Button-1>", self._show_disclaimer)
-
-    def set_wt_status(self, connected: bool):
-        color = COLORS["success"] if connected else COLORS["error"]
-        text = "WT: 已连接" if connected else "WT: 未连接"
-        self.wt_dot.config(fg=color)
-        self.wt_label.config(text=text)
-
-    def set_coyote_status(self, connected: bool, address: str = ""):
-        color = COLORS["success"] if connected else COLORS["error"]
-        text = "郊狼: 已连接" if connected else "郊狼: 未连接"
-        self.dg_dot.config(fg=color)
-        self.dg_label.config(text=text)
-        self.addr_label.config(text=address)
-
-    def _show_disclaimer(self, event=None):
-        """点击显示完整注意事项"""
-        show_disclaimer_dialog(self.winfo_toplevel())
+    def set_coyote_status(self, connected: bool, address: str = "") -> None:
+        """更新郊狼连接状态和连接地址。"""
+        self.dg_pill.set_connected(connected)
+        self.address_label.setText(address)
 
 
-class Dashboard(ttk.LabelFrame):
-    """实时数据面板 — 显示当前过载/损伤数值、电击强度"""
+class ChannelCard(QFrame):
+    """单通道实时强度卡片。"""
 
-    def __init__(self, parent):
-        super().__init__(parent, text="实时数据")
+    def __init__(self, channel: str, progress_name: str):
+        super().__init__()
+        self.setObjectName("channelCard")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(5)
+
+        heading = QHBoxLayout()
+        name = QLabel(f"{channel} 通道")
+        name.setObjectName("channelName")
+        self.value = QLabel("0")
+        self.value.setObjectName("channelValue")
+        heading.addWidget(name)
+        heading.addStretch()
+        heading.addWidget(self.value)
+
+        self.progress = QProgressBar()
+        self.progress.setObjectName(progress_name)
+        self.progress.setRange(0, 200)
+        self.progress.setTextVisible(False)
+        layout.addLayout(heading)
+        layout.addWidget(self.progress)
+
+    def set_value(self, value: int) -> None:
+        """显示强度数值与进度。"""
+        value = max(0, min(200, int(value)))
+        self.value.setText(str(value))
+        self.progress.setValue(value)
+
+
+class Dashboard(QFrame):
+    """实时遥测与悬浮窗控制面板。"""
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setObjectName("dashboardPanel")
+        self._overlay_var = ValueProxy(False)
+        self._overlay_size_var = ValueProxy("中")
+        self._overlay_callback: Callable | None = None
+        self._size_buttons: dict[str, QToolButton] = {}
         self._build()
-
-    def _build(self):
-        inner = ttk.Frame(self, style="Card.TFrame")
-        inner.pack(fill=tk.BOTH, expand=True, padx=20, pady=16)
-
-        # 当前游戏数值（大字）
-        self.value_label = tk.Label(inner, text="--.-", font=FONTS["value"],
-                                    fg=COLORS["primary"], bg=COLORS["bg_card"])
-        self.value_label.pack()
-
-        # 单位
-        self.unit_label = tk.Label(inner, text="G", font=FONTS["unit"],
-                                   fg=COLORS["text_secondary"], bg=COLORS["bg_card"])
-        self.unit_label.pack(pady=(0, 24))
-
-        # A 通道（大字突出）
-        self.ch_a_label = tk.Label(inner, text="A通道: 0",
-                                   fg=COLORS["text_primary"], bg=COLORS["bg_card"],
-                                   font=("Microsoft YaHei", 18, "bold"))
-        self.ch_a_label.pack(pady=4)
-
-        # B 通道（大字突出）
-        self.ch_b_label = tk.Label(inner, text="B通道: 0",
-                                   fg=COLORS["text_primary"], bg=COLORS["bg_card"],
-                                   font=("Microsoft YaHei", 18, "bold"))
-        self.ch_b_label.pack(pady=4)
-
-        # 事件提示
-        self.event_label = tk.Label(inner, text="",
-                                    fg=COLORS["accent"], bg=COLORS["bg_card"],
-                                    font=("Microsoft YaHei", 11, "bold"))
-        self.event_label.pack(pady=(12, 0))
-
-        # 悬浮窗开关
-        self._overlay_var = tk.BooleanVar(value=False)
-        overlay_row = ttk.Frame(inner, style="Card.TFrame")
-        overlay_row.pack(fill=tk.X, pady=(12, 0))
-        ttk.Checkbutton(overlay_row, text="悬浮窗", variable=self._overlay_var).pack(
-            side=tk.LEFT)
-        self._overlay_size_var = tk.StringVar(value="中")
-        size_row = ttk.Frame(inner, style="Card.TFrame")
-        size_row.pack(fill=tk.X, pady=(2, 0))
-        tk.Label(size_row, text="  大小:", fg=COLORS["text_secondary"],
-                 bg=COLORS["bg_card"], font=FONTS["small"]).pack(side=tk.LEFT)
-        for s in ["大", "中", "小"]:
-            ttk.Radiobutton(size_row, text=s, variable=self._overlay_size_var,
-                            value=s).pack(side=tk.LEFT, padx=2)
-
-    def update_aircraft(self, gforce: float, intensity_a: int, intensity_b: int):
-        self.value_label.config(text=f"{gforce:.1f}")
-        self.unit_label.config(text="G")
-        self.ch_a_label.config(text=f"A通道: {intensity_a}")
-        self.ch_b_label.config(text=f"B通道: {intensity_b}")
-
-    def update_tank(self, speed: float, intensity_a: int, intensity_b: int):
-        self.value_label.config(text=f"{speed:.0f}")
-        self.unit_label.config(text="km/h")
-        self.ch_a_label.config(text=f"A通道: {intensity_a}")
-        self.ch_b_label.config(text=f"B通道: {intensity_b}")
-
-    def show_event(self, text: str):
-        """显示事件提示"""
-        self.event_label.config(text=text)
 
     @property
-    def overlay_var(self):
+    def overlay_var(self) -> ValueProxy:
+        """返回悬浮窗开关值接口。"""
         return self._overlay_var
 
-    def clear(self, mode: str = "aircraft"):
-        if mode == "tank":
-            self.value_label.config(text="--")
-            self.unit_label.config(text="km/h")
-        else:
-            self.value_label.config(text="--.-")
-            self.unit_label.config(text="G")
-        self.ch_a_label.config(text="A通道: 0")
-        self.ch_b_label.config(text="B通道: 0")
-        self.event_label.config(text="")
+    def _build(self) -> None:
+        """创建实时状态面板。"""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        eyebrow = QLabel("REAL-TIME TELEMETRY")
+        eyebrow.setObjectName("eyebrow")
+        title = QLabel("实时状态")
+        title.setObjectName("sectionTitle")
+        layout.addWidget(eyebrow)
+        layout.addWidget(title)
+
+        value_row = QHBoxLayout()
+        self.value_label = QLabel("--.-")
+        self.value_label.setObjectName("liveValue")
+        self.unit_label = QLabel("G")
+        self.unit_label.setObjectName("liveUnit")
+        value_row.addWidget(self.value_label)
+        value_row.addWidget(self.unit_label, alignment=Qt.AlignBottom)
+        value_row.addStretch()
+        layout.addLayout(value_row)
+
+        self.event_label = QLabel("")
+        self.event_label.setObjectName("eventText")
+        self.event_label.setWordWrap(True)
+        layout.addWidget(self.event_label)
+
+        self.channel_a = ChannelCard("A", "channelA")
+        self.channel_b = ChannelCard("B", "channelB")
+        layout.addWidget(self.channel_a)
+        layout.addWidget(self.channel_b)
+        layout.addStretch(1)
+
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setObjectName("statusSeparator")
+        layout.addWidget(separator)
+
+        overlay_title = QLabel("游戏内悬浮窗")
+        overlay_title.setObjectName("sectionTitle")
+        self.overlay_check = QCheckBox("显示实时数据")
+        self.overlay_check.setObjectName("overlayEnabled")
+        self.overlay_check.toggled.connect(self._on_overlay_toggled)
+        layout.addWidget(overlay_title)
+        layout.addWidget(self.overlay_check)
+
+        size_row = QHBoxLayout()
+        size_hint = QLabel("显示大小")
+        size_hint.setObjectName("hintText")
+        size_row.addWidget(size_hint)
+        size_row.addStretch()
+        size_group = QButtonGroup(self)
+        for size in ("大", "中", "小"):
+            button = QToolButton()
+            button.setObjectName("sizeButton")
+            button.setText(size)
+            button.setCheckable(True)
+            size_group.addButton(button)
+            button.clicked.connect(lambda checked=False, value=size: self._set_size(value))
+            self._size_buttons[size] = button
+            size_row.addWidget(button)
+        layout.addLayout(size_row)
+
+        refresh_separator = QFrame()
+        refresh_separator.setFrameShape(QFrame.HLine)
+        refresh_separator.setObjectName("statusSeparator")
+        layout.addWidget(refresh_separator)
+
+        refresh_title = QLabel("数据刷新")
+        refresh_title.setObjectName("sectionTitle")
+        layout.addWidget(refresh_title)
+        refresh_row = QHBoxLayout()
+        refresh_hint = QLabel("刷新间隔")
+        refresh_hint.setObjectName("hintText")
+        self.refresh_ms = NoWheelSpinBox()
+        self.refresh_ms.setObjectName("refreshIntervalInput")
+        self.refresh_ms.setRange(50, 1000)
+        self.refresh_ms.setSuffix(" ms")
+        refresh_row.addWidget(refresh_hint)
+        refresh_row.addStretch()
+        refresh_row.addWidget(self.refresh_ms)
+        layout.addLayout(refresh_row)
+
+    def _set_size(self, size: str) -> None:
+        """更新悬浮窗大小选择。"""
+        self._overlay_size_var.set(size)
+        for value, button in self._size_buttons.items():
+            button.blockSignals(True)
+            button.setChecked(value == size)
+            button.blockSignals(False)
+        self._notify_overlay_change()
+
+    def _on_overlay_toggled(self, enabled: bool) -> None:
+        """同步悬浮窗开关，并立即通知主控制器。"""
+        self._overlay_var.set(enabled)
+        self._notify_overlay_change()
+
+    def set_overlay_callback(self, callback: Callable | None) -> None:
+        """设置悬浮窗开关和大小改变时的处理回调。"""
+        self._overlay_callback = callback
+
+    def _notify_overlay_change(self) -> None:
+        """通知主控制器立即应用悬浮窗设置。"""
+        if self._overlay_callback:
+            self._overlay_callback()
+
+    def set_overlay_enabled(self, enabled: bool) -> None:
+        """从配置同步悬浮窗开关。"""
+        self._overlay_var.set(enabled)
+        self.overlay_check.blockSignals(True)
+        self.overlay_check.setChecked(enabled)
+        self.overlay_check.blockSignals(False)
+
+    def set_overlay_size(self, size: str) -> None:
+        """从配置同步悬浮窗大小。"""
+        self._set_size(size if size in self._size_buttons else "中")
+
+    def update_aircraft(self, gforce: float, intensity_a: int, intensity_b: int) -> None:
+        """展示空战实时数据。"""
+        self.value_label.setText(f"{gforce:.1f}")
+        self.unit_label.setText("G")
+        self._set_channels(intensity_a, intensity_b)
+
+    def update_tank(self, speed: float, intensity_a: int, intensity_b: int) -> None:
+        """展示陆战实时数据。"""
+        self.value_label.setText(f"{speed:.0f}")
+        self.unit_label.setText("km/h")
+        self._set_channels(intensity_a, intensity_b)
+
+    def update_event(self, label: str, intensity_a: int,
+                     intensity_b: int) -> None:
+        """展示事件覆盖期间的名称与双通道强度。"""
+        self.value_label.setText(label)
+        self.unit_label.setText("")
+        self._set_channels(intensity_a, intensity_b)
+
+    def _set_channels(self, intensity_a: int, intensity_b: int) -> None:
+        """更新双通道显示。"""
+        self.channel_a.set_value(intensity_a)
+        self.channel_b.set_value(intensity_b)
+
+    def show_event(self, text: str) -> None:
+        """显示或清除当前事件提示。"""
+        self.event_label.setText(text)
+
+    def clear(self, mode: str = "aircraft") -> None:
+        """清空无效游戏数据。"""
+        self.value_label.setText("--" if mode == "tank" else "--.-")
+        self.unit_label.setText("km/h" if mode == "tank" else "G")
+        self._set_channels(0, 0)
+        self.show_event("")
 
 
-class SettingsPanel(ttk.LabelFrame):
-    """设置面板 — 所有用户可调参数"""
+class SettingsPanel(QFrame):
+    """所有既有参数的设置面板。"""
 
-    def __init__(self, parent, config_mgr: ConfigManager, on_save=None,
-                 on_mode_changed=None, overlay_var=None):
-        super().__init__(parent, text="参数设置")
+    def __init__(self, parent: QWidget, config_mgr: ConfigManager,
+                 on_save: Callable | None = None,
+                 on_mode_changed: Callable | None = None,
+                 overlay_var: ValueProxy | None = None,
+                 overlay_size_var: ValueProxy | None = None,
+                 connection_widget=None,
+                 dashboard_widget=None):
+        super().__init__(parent)
+        self.setObjectName("settingsPanel")
         self._config_mgr = config_mgr
         self._on_save_callback = on_save
         self._on_mode_changed_callback = on_mode_changed
         self._overlay_var = overlay_var
-
-        # tkinter 变量
-        self._mode_var = tk.StringVar(value="aircraft")
-
-        self._ac_enabled = tk.BooleanVar(value=True)
-        self._gforce_min = tk.DoubleVar(value=1.0)
-        self._gforce_max = tk.DoubleVar(value=10.0)
-        self._ac_ch_a = tk.IntVar(value=0)
-        self._ac_ch_b = tk.IntVar(value=0)
-
-        self._tk_enabled = tk.BooleanVar(value=True)
-        self._speed_min = tk.DoubleVar(value=0.0)
-        self._speed_max = tk.DoubleVar(value=60.0)
-        self._tk_ch_a = tk.IntVar(value=0)
-        self._tk_ch_b = tk.IntVar(value=0)
-
-        self._cas_gforce_min = tk.DoubleVar(value=1.0)
-        self._cas_gforce_max = tk.DoubleVar(value=10.0)
-        self._cas_ch_a = tk.IntVar(value=0)
-        self._cas_ch_b = tk.IntVar(value=0)
-
-        # 空战波形
-        # 陆战波形
-        self._tk_wf_a = tk.StringVar(value="恒定")
-        self._tk_wf_b = tk.StringVar(value="恒定")
-        self._tk_wf_interval = tk.IntVar(value=30)
-        # CAS波形
-        self._cas_wf_a = tk.StringVar(value="恒定")
-        self._cas_wf_b = tk.StringVar(value="恒定")
-        self._cas_wf_interval = tk.IntVar(value=30)
-
-        # 陆战事件变量
-        self._tk_ev_name = tk.StringVar(value="")
-        self._tk_ev_kill_on = tk.BooleanVar(value=False)
-        self._tk_ev_kill_a = tk.IntVar(value=0)
-        self._tk_ev_kill_b = tk.IntVar(value=0)
-        self._tk_ev_kill_dur = tk.DoubleVar(value=5.0)
-        self._tk_ev_kill_wf_a = tk.StringVar(value="恒定")
-        self._tk_ev_kill_wf_b = tk.StringVar(value="恒定")
-        self._tk_ev_death_on = tk.BooleanVar(value=False)
-        self._tk_ev_death_a = tk.IntVar(value=0)
-        self._tk_ev_death_b = tk.IntVar(value=0)
-        self._tk_ev_death_dur = tk.DoubleVar(value=5.0)
-        self._tk_ev_death_wf_a = tk.StringVar(value="恒定")
-        self._tk_ev_death_wf_b = tk.StringVar(value="恒定")
-        self._tk_ev_repair_on = tk.BooleanVar(value=False)
-        self._tk_ev_repair_a = tk.IntVar(value=0)
-        self._tk_ev_repair_b = tk.IntVar(value=0)
-        self._tk_ev_repair_wf_a = tk.StringVar(value="恒定")
-        self._tk_ev_repair_wf_b = tk.StringVar(value="恒定")
-
-        self._ws_port = tk.IntVar(value=8765)
-        self._refresh_ms = tk.IntVar(value=200)
-
+        self._overlay_size_var = overlay_size_var
+        self._connection_widget = connection_widget
+        self._dashboard_widget = dashboard_widget
+        self._waveforms = ALL_WAVEFORMS + ["随机"]
         self._build()
         self._load_config()
 
-    @property
-    def is_aircraft_mode(self) -> bool:
-        return self._mode_var.get() == "aircraft"
+    def _build(self) -> None:
+        """构建模式切换、参数页和保存操作。"""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
 
-    def get_mode(self) -> str:
-        return self._mode_var.get()
+        title_row = QHBoxLayout()
+        title = QLabel("参数设置")
+        title.setObjectName("sectionTitle")
+        title_row.addWidget(title)
+        title_row.addStretch()
+        layout.addLayout(title_row)
 
-    def _build(self):
-        # === 可滚动区域 ===
-        canvas = tk.Canvas(self, bg=COLORS["bg_card"], highlightthickness=0)
-        scrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL, command=canvas.yview)
+        modes = QFrame()
+        modes.setObjectName("sectionCard")
+        mode_layout = QHBoxLayout(modes)
+        mode_layout.setContentsMargins(6, 6, 6, 6)
+        self.air_button = QToolButton()
+        self.air_button.setObjectName("modeButton")
+        self.air_button.setText("空战")
+        self.air_button.setCheckable(True)
+        self.tank_button = QToolButton()
+        self.tank_button.setObjectName("modeButton")
+        self.tank_button.setText("陆战")
+        self.tank_button.setCheckable(True)
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+        self._mode_group.addButton(self.air_button)
+        self._mode_group.addButton(self.tank_button)
+        self.air_button.clicked.connect(lambda: self._set_mode("aircraft"))
+        self.tank_button.clicked.connect(lambda: self._set_mode("tank"))
+        mode_layout.addWidget(self.air_button)
+        mode_layout.addWidget(self.tank_button)
+        mode_layout.addStretch()
+        layout.addWidget(modes)
 
-        inner = ttk.Frame(canvas, style="Card.TFrame")
-        inner.bind("<Configure>",
-                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        self.pages = QStackedWidget()
+        self.pages.setObjectName("settingsPages")
+        self.pages.addWidget(self._make_air_page())
+        self.pages.addWidget(self._make_tank_page())
+        layout.addWidget(self.pages, 1)
 
-        self._canvas_win = canvas.create_window((0, 0), window=inner, anchor=tk.NW)
-        canvas.configure(yscrollcommand=scrollbar.set)
+        actions = QHBoxLayout()
+        self.save_button = QPushButton("保存设置")
+        self.save_button.setObjectName("saveButton")
+        self.save_button.clicked.connect(self._on_save)
+        self.reset_button = QPushButton("恢复默认")
+        self.reset_button.setObjectName("secondaryButton")
+        self.reset_button.clicked.connect(self._on_reset)
+        self.save_feedback = QLabel("")
+        self.save_feedback.setObjectName("hintText")
+        actions.addWidget(self.save_button)
+        actions.addWidget(self.reset_button)
+        actions.addWidget(self.save_feedback)
+        actions.addStretch()
+        layout.addLayout(actions)
 
-        # inner 宽度跟随 canvas
-        def _on_canvas_resize(event):
-            canvas.itemconfig(self._canvas_win, width=event.width)
-        canvas.bind("<Configure>", _on_canvas_resize)
+    def _make_scroll_page(self, builder: Callable[[QVBoxLayout], None]) -> QScrollArea:
+        """创建可滚动设置页。"""
+        scroll = QScrollArea()
+        scroll.setObjectName("settingsScroll")
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        content.setObjectName("settingsContent")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 2, 0)
+        layout.setSpacing(10)
+        builder(layout)
+        layout.addStretch()
+        scroll.setWidget(content)
+        return scroll
 
-        # 鼠标滚轮
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120) * 3), "units")
-        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+    def _make_air_page(self) -> QScrollArea:
+        """创建空战设置页。"""
+        return self._make_scroll_page(self._build_air_content)
 
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    def _build_air_content(self, layout: QVBoxLayout) -> None:
+        """填充空战设置。"""
+        card, form = self._make_section("空战触发", "过载与通道")
+        self.ac_enabled = QCheckBox("启用过载触发")
+        self.ac_enabled.setObjectName("aircraftEnabled")
+        self.gforce_min = self._double_box(0, 20, 0.5, " G")
+        self.gforce_max = self._double_box(0, 20, 0.5, " G")
+        self.ac_ch_a = self._int_box(0, 200)
+        self.ac_ch_b = self._int_box(0, 200)
+        self.ac_wf_a = self._combo(self._waveforms)
+        self.ac_wf_b = self._combo(self._waveforms)
+        self.ac_wf_interval = self._int_box(5, 300, " 秒")
+        form.addRow(self.ac_enabled)
+        self._add_row(form, "过载下限", self.gforce_min)
+        self._add_row(form, "过载上限", self.gforce_max)
+        self._add_row(form, "A 通道最大强度", self.ac_ch_a)
+        self._add_row(form, "B 通道最大强度", self.ac_ch_b)
+        self._add_row(form, "A 通道波形", self.ac_wf_a)
+        self._add_row(form, "B 通道波形", self.ac_wf_b)
+        self._add_row(form, "随机间隔", self.ac_wf_interval)
+        layout.addWidget(card)
 
-        # === 模式选择 ===
-        mode_frame = ttk.Frame(inner, style="Card.TFrame")
-        mode_frame.pack(fill=tk.X, pady=(0, 12), padx=12)
+        event_card, event_layout = self._make_collapsible("事件设置", "空战击杀与坠毁反馈")
+        self.air_event_name = QLineEdit()
+        self.air_event_name.setObjectName("airEventName")
+        self._add_row(event_layout, "游戏昵称", self.air_event_name)
+        self._make_event_controls(event_layout, "air_kill", "击杀提醒")
+        self._make_event_controls(event_layout, "air_death", "被击落/坠毁惩罚")
+        layout.addWidget(event_card)
 
-        tk.Label(mode_frame, text="模式选择", font=FONTS["heading"],
-                 fg=COLORS["text_primary"], bg=COLORS["bg_card"]).pack(anchor=tk.W)
+    def _make_tank_page(self) -> QScrollArea:
+        """创建陆战设置页。"""
+        return self._make_scroll_page(self._build_tank_content)
 
-        radio_frame = ttk.Frame(mode_frame, style="Card.TFrame")
-        radio_frame.pack(fill=tk.X, pady=(4, 0))
-        ttk.Radiobutton(radio_frame, text="🛩 空战", variable=self._mode_var,
-                        value="aircraft").pack(side=tk.LEFT, padx=(0, 16))
-        ttk.Radiobutton(radio_frame, text="🚧 陆战", variable=self._mode_var,
-                        value="tank").pack(side=tk.LEFT)
+    def _build_tank_content(self, layout: QVBoxLayout) -> None:
+        """填充陆战与 CAS 设置。"""
+        card, form = self._make_section("陆战触发", "速度、波形与通道")
+        self.tank_enabled = QCheckBox("启用速度触发")
+        self.tank_enabled.setObjectName("tankEnabled")
+        self.speed_min = self._double_box(0, 200, 1, " km/h")
+        self.speed_max = self._double_box(0, 200, 1, " km/h")
+        self.tank_ch_a = self._int_box(0, 200)
+        self.tank_ch_b = self._int_box(0, 200)
+        self.tank_wf_a = self._combo(self._waveforms)
+        self.tank_wf_b = self._combo(self._waveforms)
+        self.tank_wf_interval = self._int_box(5, 300, " 秒")
+        form.addRow(self.tank_enabled)
+        self._add_row(form, "速度下限", self.speed_min)
+        self._add_row(form, "速度上限", self.speed_max)
+        self._add_row(form, "A 通道最大强度", self.tank_ch_a)
+        self._add_row(form, "B 通道最大强度", self.tank_ch_b)
+        self._add_row(form, "A 通道波形", self.tank_wf_a)
+        self._add_row(form, "B 通道波形", self.tank_wf_b)
+        self._add_row(form, "随机间隔", self.tank_wf_interval)
+        layout.addWidget(card)
 
-        # === 空战设置 ===
-        from ..waveforms import ALL_WAVEFORMS
-        WF_OPTIONS = ALL_WAVEFORMS + ["随机"]
+        cas_card, cas_form = self._make_section("CAS 设置", "陆战模式上飞机时使用")
+        self.cas_gforce_min = self._double_box(0, 20, 0.5, " G")
+        self.cas_gforce_max = self._double_box(0, 20, 0.5, " G")
+        self.cas_ch_a = self._int_box(0, 200)
+        self.cas_ch_b = self._int_box(0, 200)
+        self.cas_wf_a = self._combo(self._waveforms)
+        self.cas_wf_b = self._combo(self._waveforms)
+        self.cas_wf_interval = self._int_box(5, 300, " 秒")
+        self._add_row(cas_form, "过载下限", self.cas_gforce_min)
+        self._add_row(cas_form, "过载上限", self.cas_gforce_max)
+        self._add_row(cas_form, "A 通道最大强度", self.cas_ch_a)
+        self._add_row(cas_form, "B 通道最大强度", self.cas_ch_b)
+        self._add_row(cas_form, "A 通道波形", self.cas_wf_a)
+        self._add_row(cas_form, "B 通道波形", self.cas_wf_b)
+        self._add_row(cas_form, "随机间隔", self.cas_wf_interval)
+        layout.addWidget(cas_card)
 
-        # 事件变量（UI 前初始化）
-        self._ev_name_var = tk.StringVar(value="")
-        self._ev_kill_on_var = tk.BooleanVar(value=False)
-        self._ev_kill_a_var = tk.IntVar(value=0)
-        self._ev_kill_b_var = tk.IntVar(value=0)
-        self._ev_kill_dur_var = tk.DoubleVar(value=5.0)
-        self._ev_kill_wf_a_var = tk.StringVar(value="恒定")
-        self._ev_kill_wf_b_var = tk.StringVar(value="恒定")
-        self._ev_death_on_var = tk.BooleanVar(value=False)
-        self._ev_death_a_var = tk.IntVar(value=0)
-        self._ev_death_b_var = tk.IntVar(value=0)
-        self._ev_death_dur_var = tk.DoubleVar(value=5.0)
-        self._ev_death_wf_a_var = tk.StringVar(value="恒定")
-        self._ev_death_wf_b_var = tk.StringVar(value="恒定")
+        event_card, event_layout = self._make_collapsible("事件设置", "陆战击杀、被击毁与维修反馈")
+        self.tank_event_name = QLineEdit()
+        self.tank_event_name.setObjectName("tankEventName")
+        self._add_row(event_layout, "游戏昵称", self.tank_event_name)
+        self._make_event_controls(event_layout, "tank_kill", "击杀提醒")
+        self._make_event_controls(event_layout, "tank_death", "被击毁惩罚")
+        repair = self._make_repair_controls(event_layout)
+        self.tank_repair_enabled = repair["enabled"]
+        self.tank_repair_a = repair["a"]
+        self.tank_repair_b = repair["b"]
+        self.tank_repair_wf_a = repair["wf_a"]
+        self.tank_repair_wf_b = repair["wf_b"]
+        layout.addWidget(event_card)
 
-        self.aircraft_frame = ttk.LabelFrame(inner, text="空战设置")
-        self.aircraft_frame.pack(fill=tk.X, pady=(0, 8))
-        self._make_check_row(self.aircraft_frame, "启用过载电击", self._ac_enabled, 0)
-        self._make_double_row(self.aircraft_frame, "过载下限:", self._gforce_min, 0, 20, 0.5, " G", 1)
-        self._make_double_row(self.aircraft_frame, "过载上限:", self._gforce_max, 0, 20, 0.5, " G", 1)
-        self._make_int_row(self.aircraft_frame, "A通道最大强度:", self._ac_ch_a, 0, 200, 2)
-        self._make_int_row(self.aircraft_frame, "B通道最大强度:", self._ac_ch_b, 0, 200, 3)
-        # 事件子组（可折叠）
-        self._ev_toggle_btn = ttk.Button(self.aircraft_frame, text="▶ 事件设置",
-                                         command=lambda: self._toggle_ev(),
-                                         style="Secondary.TButton")
-        self._ev_toggle_btn.pack(fill=tk.X, padx=12, pady=(8, 0))
-        self._ev_content = ttk.Frame(self.aircraft_frame, style="Card.TFrame")
-        self._make_entry_row(self._ev_content, "游戏昵称:", self._ev_name_var, 0)
-        self._make_check_row(self._ev_content, "击杀提醒", self._ev_kill_on_var, 1)
-        self._make_int_row(self._ev_content, "  A通道:", self._ev_kill_a_var, 0, 200, 2)
-        self._make_int_row(self._ev_content, "  B通道:", self._ev_kill_b_var, 0, 200, 3)
-        self._make_combo_row(self._ev_content, "  A波形:", self._ev_kill_wf_a_var, ALL_WAVEFORMS, 4)
-        self._make_combo_row(self._ev_content, "  B波形:", self._ev_kill_wf_b_var, ALL_WAVEFORMS, 5)
-        self._make_double_row(self._ev_content, "  持续:", self._ev_kill_dur_var, 0.1, 30, 0.5, " 秒", 6)
-        self._make_check_row(self._ev_content, "被击落/坠毁惩罚", self._ev_death_on_var, 7)
-        self._make_int_row(self._ev_content, "  A通道:", self._ev_death_a_var, 0, 200, 8)
-        self._make_int_row(self._ev_content, "  B通道:", self._ev_death_b_var, 0, 200, 9)
-        self._make_combo_row(self._ev_content, "  A波形:", self._ev_death_wf_a_var, ALL_WAVEFORMS, 10)
-        self._make_combo_row(self._ev_content, "  B波形:", self._ev_death_wf_b_var, ALL_WAVEFORMS, 11)
-        self._make_double_row(self._ev_content, "  持续:", self._ev_death_dur_var, 0.1, 30, 0.5, " 秒", 12)
-        # === 陆战设置 ===
-        self.tank_frame = ttk.LabelFrame(inner, text="陆战设置")
-        self.tank_frame.pack(fill=tk.X, pady=(0, 8))
-        self._make_check_row(self.tank_frame, "启用速度电击", self._tk_enabled, 0)
-        self._make_double_row(self.tank_frame, "速度下限:", self._speed_min, 0, 200, 1, " km/h", 1)
-        self._make_double_row(self.tank_frame, "速度上限:", self._speed_max, 0, 200, 1, " km/h", 1)
-        self._make_int_row(self.tank_frame, "A通道最大强度:", self._tk_ch_a, 0, 200, 2)
-        self._make_int_row(self.tank_frame, "B通道最大强度:", self._tk_ch_b, 0, 200, 3)
-        self._make_combo_row(self.tank_frame, "A通道波形:", self._tk_wf_a, WF_OPTIONS, 4)
-        self._make_combo_row(self.tank_frame, "B通道波形:", self._tk_wf_b, WF_OPTIONS, 5)
-        self._make_int_row(self.tank_frame, "随机间隔:", self._tk_wf_interval, 5, 300, 6, " 秒")
-        # 陆战事件子组（可折叠）
-        self._tk_ev_toggle_btn = ttk.Button(self.tank_frame, text="▶ 事件设置",
-                                            command=lambda: self._toggle_tk_ev(),
-                                            style="Secondary.TButton")
-        self._tk_ev_toggle_btn.pack(fill=tk.X, padx=12, pady=(8, 0))
-        self._tk_ev_content = ttk.Frame(self.tank_frame, style="Card.TFrame")
-        self._make_entry_row(self._tk_ev_content, "游戏昵称:", self._tk_ev_name, 0)
-        self._make_check_row(self._tk_ev_content, "击杀提醒", self._tk_ev_kill_on, 1)
-        self._make_int_row(self._tk_ev_content, "  A通道:", self._tk_ev_kill_a, 0, 200, 2)
-        self._make_int_row(self._tk_ev_content, "  B通道:", self._tk_ev_kill_b, 0, 200, 3)
-        self._make_combo_row(self._tk_ev_content, "  A波形:", self._tk_ev_kill_wf_a, ALL_WAVEFORMS, 4)
-        self._make_combo_row(self._tk_ev_content, "  B波形:", self._tk_ev_kill_wf_b, ALL_WAVEFORMS, 5)
-        self._make_double_row(self._tk_ev_content, "  持续:", self._tk_ev_kill_dur, 0.1, 30, 0.5, " 秒", 6)
-        self._make_check_row(self._tk_ev_content, "被击毁惩罚", self._tk_ev_death_on, 7)
-        self._make_int_row(self._tk_ev_content, "  A通道:", self._tk_ev_death_a, 0, 200, 8)
-        self._make_int_row(self._tk_ev_content, "  B通道:", self._tk_ev_death_b, 0, 200, 9)
-        self._make_combo_row(self._tk_ev_content, "  A波形:", self._tk_ev_death_wf_a, ALL_WAVEFORMS, 10)
-        self._make_combo_row(self._tk_ev_content, "  B波形:", self._tk_ev_death_wf_b, ALL_WAVEFORMS, 11)
-        self._make_double_row(self._tk_ev_content, "  持续:", self._tk_ev_death_dur, 0.1, 30, 0.5, " 秒", 12)
-        self._make_check_row(self._tk_ev_content, "维修惩罚", self._tk_ev_repair_on, 13)
-        self._make_int_row(self._tk_ev_content, "  A通道:", self._tk_ev_repair_a, 0, 200, 14)
-        self._make_int_row(self._tk_ev_content, "  B通道:", self._tk_ev_repair_b, 0, 200, 15)
-        self._make_combo_row(self._tk_ev_content, "  A波形:", self._tk_ev_repair_wf_a, ALL_WAVEFORMS, 16)
-        self._make_combo_row(self._tk_ev_content, "  B波形:", self._tk_ev_repair_wf_b, ALL_WAVEFORMS, 17)
+    def _make_section(self, title: str, subtitle: str) -> tuple[QFrame, QFormLayout]:
+        """创建常规设置区块。"""
+        card = QFrame()
+        card.setObjectName("sectionCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setSpacing(8)
+        heading = QLabel(title)
+        heading.setObjectName("sectionTitle")
+        hint = QLabel(subtitle)
+        hint.setObjectName("hintText")
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setFormAlignment(Qt.AlignTop)
+        form.setHorizontalSpacing(18)
+        form.setVerticalSpacing(8)
+        layout.addWidget(heading)
+        layout.addWidget(hint)
+        layout.addSpacing(3)
+        layout.addLayout(form)
+        return card, form
 
-        # === CAS设置（陆战空中支援） ===
-        self.cas_frame = ttk.LabelFrame(inner, text="CAS设置（陆战上飞机时）")
-        self.cas_frame.pack(fill=tk.X, pady=(0, 8))
-        self._make_double_row(self.cas_frame, "过载下限:", self._cas_gforce_min, 0, 20, 0.5, " G", 0)
-        self._make_double_row(self.cas_frame, "过载上限:", self._cas_gforce_max, 0, 20, 0.5, " G", 1)
-        self._make_int_row(self.cas_frame, "A通道最大强度:", self._cas_ch_a, 0, 200, 2)
-        self._make_int_row(self.cas_frame, "B通道最大强度:", self._cas_ch_b, 0, 200, 3)
-        self._make_combo_row(self.cas_frame, "A通道波形:", self._cas_wf_a, WF_OPTIONS, 4)
-        self._make_combo_row(self.cas_frame, "B通道波形:", self._cas_wf_b, WF_OPTIONS, 5)
-        self._make_int_row(self.cas_frame, "随机间隔:", self._cas_wf_interval, 5, 300, 6, " 秒")
+    def _make_collapsible(self, title: str, subtitle: str) -> tuple[QFrame, QFormLayout]:
+        """创建默认收起的事件设置区块。"""
+        card = QFrame()
+        card.setObjectName("sectionCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(14, 10, 14, 12)
+        layout.setSpacing(6)
+        toggle = QToolButton()
+        toggle.setObjectName("textButton")
+        toggle.setText(title)
+        toggle.setCheckable(True)
+        toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        toggle.setArrowType(Qt.RightArrow)
+        hint = QLabel(subtitle)
+        hint.setObjectName("hintText")
+        content = QWidget()
+        content.setObjectName("collapsibleContent")
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 8, 0, 0)
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setHorizontalSpacing(18)
+        form.setVerticalSpacing(8)
+        content_layout.addLayout(form)
+        content.setVisible(False)
 
-        # === 连接设置 ===
-        conn_frame = ttk.LabelFrame(inner, text="连接设置")
-        conn_frame.pack(fill=tk.X, pady=(0, 8))
-        self._make_int_row(conn_frame, "WebSocket 端口:", self._ws_port, 1024, 65535, 0)
-        self._make_int_row(conn_frame, "刷新间隔:", self._refresh_ms, 50, 1000, 1, " ms")
+        def set_expanded(expanded: bool) -> None:
+            toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+            content.setVisible(expanded)
 
-        # === 按钮 ===
-        btn_frame = ttk.Frame(inner, style="Card.TFrame")
-        btn_frame.pack(fill=tk.X)
+        toggle.toggled.connect(set_expanded)
+        layout.addWidget(toggle)
+        layout.addWidget(hint)
+        layout.addWidget(content)
+        return card, form
 
-        self.save_btn = ttk.Button(btn_frame, text="保存设置",
-                                   command=self._on_save, style="TButton")
-        self.save_btn.pack(side=tk.LEFT, padx=(0, 8))
+    def _make_event_controls(self, form: QFormLayout, prefix: str, title: str) -> None:
+        """创建击杀或死亡事件的完整控件组。"""
+        enabled = QCheckBox(title)
+        enabled.setObjectName(f"{prefix}Enabled")
+        a_value = self._int_box(0, 200)
+        b_value = self._int_box(0, 200)
+        duration = self._double_box(0.1, 30, 0.5, " 秒")
+        waveform_a = self._combo(ALL_WAVEFORMS)
+        waveform_b = self._combo(ALL_WAVEFORMS)
+        setattr(self, f"{prefix}_enabled", enabled)
+        setattr(self, f"{prefix}_a", a_value)
+        setattr(self, f"{prefix}_b", b_value)
+        setattr(self, f"{prefix}_duration", duration)
+        setattr(self, f"{prefix}_wf_a", waveform_a)
+        setattr(self, f"{prefix}_wf_b", waveform_b)
+        form.addRow(enabled)
+        self._add_row(form, "  A 通道强度", a_value)
+        self._add_row(form, "  B 通道强度", b_value)
+        self._add_row(form, "  持续时间", duration)
+        self._add_row(form, "  A 通道波形", waveform_a)
+        self._add_row(form, "  B 通道波形", waveform_b)
 
-        self.reset_btn = ttk.Button(btn_frame, text="恢复默认",
-                                    command=self._on_reset, style="Secondary.TButton")
-        self.reset_btn.pack(side=tk.LEFT)
+    def _make_repair_controls(self, form: QFormLayout) -> dict:
+        """创建维修事件控件组。"""
+        controls = {
+            "enabled": QCheckBox("维修惩罚"),
+            "a": self._int_box(0, 200),
+            "b": self._int_box(0, 200),
+            "wf_a": self._combo(ALL_WAVEFORMS),
+            "wf_b": self._combo(ALL_WAVEFORMS),
+        }
+        controls["enabled"].setObjectName("tankRepairEnabled")
+        form.addRow(controls["enabled"])
+        self._add_row(form, "  A 通道强度", controls["a"])
+        self._add_row(form, "  B 通道强度", controls["b"])
+        self._add_row(form, "  A 通道波形", controls["wf_a"])
+        self._add_row(form, "  B 通道波形", controls["wf_b"])
+        return controls
 
-        # 保存反馈标签
-        self.save_feedback = tk.Label(btn_frame, text="",
-                                      fg=COLORS["success"], bg=COLORS["bg_card"],
-                                      font=("Microsoft YaHei", 9, "bold"))
-        self.save_feedback.pack(side=tk.LEFT, padx=12)
+    def _add_row(self, form: QFormLayout, label: str, widget: QWidget) -> None:
+        """为表单添加统一样式标签。"""
+        label_widget = QLabel(label)
+        label_widget.setObjectName("formLabel")
+        form.addRow(label_widget, widget)
 
-        # 模式切换时显示/隐藏设置组
-        self._mode_var.trace_add("write", lambda *a: self._on_mode_changed())
+    def _int_box(self, minimum: int, maximum: int,
+                 suffix: str = "") -> NoWheelSpinBox:
+        """创建整数输入框。"""
+        box = NoWheelSpinBox()
+        box.setObjectName("numberInput")
+        box.setRange(minimum, maximum)
+        box.setSuffix(suffix)
+        return box
 
-    def _make_int_row(self, parent, label, var, min_v, max_v, row, suffix="",
-                      return_row=False):
-        """创建 标签 + 数字输入 + 单位 的行"""
-        row_frame = ttk.Frame(parent, style="Card.TFrame")
-        row_frame.pack(fill=tk.X, padx=12, pady=3)
+    def _double_box(self, minimum: float, maximum: float, step: float,
+                    suffix: str = "") -> NoWheelDoubleSpinBox:
+        """创建小数输入框。"""
+        box = NoWheelDoubleSpinBox()
+        box.setObjectName("decimalInput")
+        box.setRange(minimum, maximum)
+        box.setSingleStep(step)
+        box.setDecimals(1)
+        box.setSuffix(suffix)
+        return box
 
-        tk.Label(row_frame, text=label, fg=COLORS["text_primary"],
-                 bg=COLORS["bg_card"], font=FONTS["default"]).pack(side=tk.LEFT)
+    def _combo(self, values: list[str]) -> NoWheelComboBox:
+        """创建下拉选项框。"""
+        combo = NoWheelComboBox()
+        combo.setObjectName("waveformInput")
+        combo.addItems(values)
+        return combo
 
-        spin = ttk.Spinbox(row_frame, from_=min_v, to=max_v,
-                           textvariable=var, width=8,
-                           font=FONTS["default"])
-        spin.bind("<MouseWheel>", lambda e: "break")
-        # 失焦时强制回写 IntVar（修复 ttk.Spinbox textvariable 不实时同步）
-        spin.bind("<FocusOut>", lambda e, v=var, s=spin: v.set(int(float(s.get()))))
-        spin.pack(side=tk.LEFT, padx=(8, 4))
-
-        if suffix:
-            tk.Label(row_frame, text=suffix, fg=COLORS["text_secondary"],
-                     bg=COLORS["bg_card"], font=FONTS["small"]).pack(side=tk.LEFT)
-
-        if return_row:
-            return row_frame
-
-    def _make_combo_row(self, parent, label, var, values, row):
-        """创建 标签 + 下拉框 的行"""
-        row_frame = ttk.Frame(parent, style="Card.TFrame")
-        row_frame.pack(fill=tk.X, padx=12, pady=3)
-        tk.Label(row_frame, text=label, fg=COLORS["text_primary"],
-                 bg=COLORS["bg_card"], font=FONTS["default"]).pack(side=tk.LEFT)
-        combo = ttk.Combobox(row_frame, textvariable=var, values=values,
-                             state="readonly", width=10, font=FONTS["default"])
-        combo.bind("<MouseWheel>", lambda e: "break")
-        combo.pack(side=tk.LEFT, padx=(8, 4))
-
-    def _make_entry_row(self, parent, label, var, row):
-        """创建 标签 + 文本输入框 的行"""
-        row_frame = ttk.Frame(parent, style="Card.TFrame")
-        row_frame.pack(fill=tk.X, padx=12, pady=3)
-        tk.Label(row_frame, text=label, fg=COLORS["text_primary"],
-                 bg=COLORS["bg_card"], font=FONTS["default"]).pack(side=tk.LEFT)
-        entry = ttk.Entry(row_frame, textvariable=var, width=15,
-                          font=FONTS["default"])
-        entry.pack(side=tk.LEFT, padx=(8, 4))
-
-    def _make_check_row(self, parent, label, var, row):
-        """创建 勾选框 的行"""
-        row_frame = ttk.Frame(parent, style="Card.TFrame")
-        row_frame.pack(fill=tk.X, padx=12, pady=3)
-        ttk.Checkbutton(row_frame, text=label, variable=var).pack(side=tk.LEFT)
-
-    def _make_double_row(self, parent, label, var, min_v, max_v, step, suffix, row):
-        """创建 标签 + 浮点数输入 + 单位 的行"""
-        row_frame = ttk.Frame(parent, style="Card.TFrame")
-        row_frame.pack(fill=tk.X, padx=12, pady=3)
-
-        tk.Label(row_frame, text=label, fg=COLORS["text_primary"],
-                 bg=COLORS["bg_card"], font=FONTS["default"]).pack(side=tk.LEFT)
-
-        spin = ttk.Spinbox(row_frame, from_=min_v, to=max_v,
-                           textvariable=var, width=8,
-                           font=FONTS["default"],
-                           increment=step)
-        spin.pack(side=tk.LEFT, padx=(8, 4))
-
-        if suffix:
-            tk.Label(row_frame, text=suffix, fg=COLORS["text_secondary"],
-                     bg=COLORS["bg_card"], font=FONTS["small"]).pack(side=tk.LEFT)
-
-    def _toggle_ev(self):
-        """折叠/展开空战事件设置"""
-        if self._ev_content.winfo_ismapped():
-            self._ev_content.pack_forget()
-            self._ev_toggle_btn.config(text="▶ 事件设置")
-        else:
-            self._ev_content.pack(fill=tk.X, padx=12, pady=(0, 3))
-            self._ev_toggle_btn.config(text="▼ 事件设置")
-
-    def _toggle_tk_ev(self):
-        """折叠/展开陆战事件设置"""
-        if self._tk_ev_content.winfo_ismapped():
-            self._tk_ev_content.pack_forget()
-            self._tk_ev_toggle_btn.config(text="▶ 事件设置")
-        else:
-            self._tk_ev_content.pack(fill=tk.X, padx=12, pady=(0, 3))
-            self._tk_ev_toggle_btn.config(text="▼ 事件设置")
-
-    def _on_mode_changed(self):
-        """切换空战/陆战设置组的显示"""
-        # 先全部隐藏
-        self.aircraft_frame.pack_forget()
-        self.tank_frame.pack_forget()
-        self.cas_frame.pack_forget()
-
-        is_air = self._mode_var.get() == "aircraft"
-        if is_air:
-            self.aircraft_frame.pack(fill=tk.X, pady=(0, 8))
-        else:
-            self.tank_frame.pack(fill=tk.X, pady=(0, 8))
-            self.cas_frame.pack(fill=tk.X, pady=(0, 8))
-
-        # 通知外部（即时刷新仪表盘）
-        if self._on_mode_changed_callback:
+    def _set_mode(self, mode: str, notify: bool = True) -> None:
+        """切换空战或陆战设置页。"""
+        is_air = mode == "aircraft"
+        self.air_button.blockSignals(True)
+        self.tank_button.blockSignals(True)
+        self.air_button.setChecked(is_air)
+        self.tank_button.setChecked(not is_air)
+        self.air_button.blockSignals(False)
+        self.tank_button.blockSignals(False)
+        self.pages.setCurrentIndex(0 if is_air else 1)
+        if notify and self._on_mode_changed_callback:
             self._on_mode_changed_callback()
 
-    def _load_config(self):
-        """从配置管理器加载到 UI"""
+    def get_mode(self) -> str:
+        """返回当前选择的模式。"""
+        return "aircraft" if self.air_button.isChecked() else "tank"
+
+    def _set_combo_value(self, combo: QComboBox, value: str) -> None:
+        """设置下拉项，旧配置未知时回退到第一项。"""
+        index = combo.findText(value)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+
+    def _load_config(self) -> None:
+        """将当前配置写入控件。"""
         cfg = self._config_mgr.config
+        ac = cfg.aircraft
+        self.ac_enabled.setChecked(ac.enabled)
+        self.gforce_min.setValue(ac.gforce_min)
+        self.gforce_max.setValue(ac.gforce_max)
+        self.ac_ch_a.setValue(ac.channel_a_max)
+        self.ac_ch_b.setValue(ac.channel_b_max)
+        self._set_combo_value(self.ac_wf_a, ac.waveform_a)
+        self._set_combo_value(self.ac_wf_b, ac.waveform_b)
+        self.ac_wf_interval.setValue(ac.random_interval)
 
-        self._ac_enabled.set(cfg.aircraft.enabled)
-        self._gforce_min.set(cfg.aircraft.gforce_min)
-        self._gforce_max.set(cfg.aircraft.gforce_max)
-        self._ac_ch_a.set(cfg.aircraft.channel_a_max)
-        self._ac_ch_b.set(cfg.aircraft.channel_b_max)
+        tank = cfg.tank
+        self.tank_enabled.setChecked(tank.enabled)
+        self.speed_min.setValue(tank.speed_min)
+        self.speed_max.setValue(tank.speed_max)
+        self.tank_ch_a.setValue(tank.channel_a_max)
+        self.tank_ch_b.setValue(tank.channel_b_max)
+        self._set_combo_value(self.tank_wf_a, tank.waveform_a)
+        self._set_combo_value(self.tank_wf_b, tank.waveform_b)
+        self.tank_wf_interval.setValue(tank.random_interval)
 
-        self._tk_enabled.set(cfg.tank.enabled)
-        self._speed_min.set(cfg.tank.speed_min)
-        self._speed_max.set(cfg.tank.speed_max)
-        self._tk_ch_a.set(cfg.tank.channel_a_max)
-        self._tk_ch_b.set(cfg.tank.channel_b_max)
+        cas = cfg.cas
+        self.cas_gforce_min.setValue(cas.gforce_min)
+        self.cas_gforce_max.setValue(cas.gforce_max)
+        self.cas_ch_a.setValue(cas.channel_a_max)
+        self.cas_ch_b.setValue(cas.channel_b_max)
+        self._set_combo_value(self.cas_wf_a, cas.waveform_a)
+        self._set_combo_value(self.cas_wf_b, cas.waveform_b)
+        self.cas_wf_interval.setValue(cas.random_interval)
 
-        self._cas_gforce_min.set(cfg.cas.gforce_min)
-        self._cas_gforce_max.set(cfg.cas.gforce_max)
-        self._cas_ch_a.set(cfg.cas.channel_a_max)
-        self._cas_ch_b.set(cfg.cas.channel_b_max)
+        self._load_event_controls("air_kill", cfg.events, "kill")
+        self._load_event_controls("air_death", cfg.events, "death")
+        self.air_event_name.setText(cfg.events.player_name)
+        self._load_event_controls("tank_kill", cfg.tank_events, "kill")
+        self._load_event_controls("tank_death", cfg.tank_events, "death")
+        self.tank_event_name.setText(cfg.tank_events.player_name)
+        self.tank_repair_enabled.setChecked(cfg.tank_events.repair_enabled)
+        self.tank_repair_a.setValue(cfg.tank_events.repair_ch_a)
+        self.tank_repair_b.setValue(cfg.tank_events.repair_ch_b)
+        self._set_combo_value(self.tank_repair_wf_a, cfg.tank_events.repair_wf_a)
+        self._set_combo_value(self.tank_repair_wf_b, cfg.tank_events.repair_wf_b)
 
-        self._ws_port.set(cfg.app.ws_port)
-        self._refresh_ms.set(cfg.app.refresh_interval_ms)
-        self._mode_var.set(cfg.app.mode)
+        self._connection_widget.ws_port.setValue(cfg.app.ws_port)
+        self._connection_widget.v4_relay_url.setText(cfg.app.v4_relay_url)
+        self._connection_widget.set_protocol(cfg.app.dglab_protocol)
+        self._dashboard_widget.refresh_ms.setValue(
+            cfg.app.refresh_interval_ms
+        )
+        self._set_mode(cfg.app.mode)
 
-        self._tk_wf_a.set(cfg.tank.waveform_a)
-        self._tk_wf_b.set(cfg.tank.waveform_b)
-        self._tk_wf_interval.set(cfg.tank.random_interval)
-        self._cas_wf_a.set(cfg.cas.waveform_a)
-        self._cas_wf_b.set(cfg.cas.waveform_b)
-        self._cas_wf_interval.set(cfg.cas.random_interval)
+    def _load_event_controls(self, prefix: str, config, kind: str) -> None:
+        """将事件配置加载到一组控件。"""
+        getattr(self, f"{prefix}_enabled").setChecked(getattr(config, f"{kind}_enabled"))
+        getattr(self, f"{prefix}_a").setValue(getattr(config, f"{kind}_ch_a"))
+        getattr(self, f"{prefix}_b").setValue(getattr(config, f"{kind}_ch_b"))
+        getattr(self, f"{prefix}_duration").setValue(getattr(config, f"{kind}_duration"))
+        self._set_combo_value(getattr(self, f"{prefix}_wf_a"), getattr(config, f"{kind}_wf_a"))
+        self._set_combo_value(getattr(self, f"{prefix}_wf_b"), getattr(config, f"{kind}_wf_b"))
 
-        self._ev_name_var.set(cfg.events.player_name)
-        self._ev_kill_on_var.set(cfg.events.kill_enabled)
-        self._ev_kill_a_var.set(cfg.events.kill_ch_a)
-        self._ev_kill_b_var.set(cfg.events.kill_ch_b)
-        self._ev_kill_dur_var.set(cfg.events.kill_duration)
-        self._ev_kill_wf_a_var.set(cfg.events.kill_wf_a)
-        self._ev_kill_wf_b_var.set(cfg.events.kill_wf_b)
-        self._ev_death_on_var.set(cfg.events.death_enabled)
-        self._ev_death_a_var.set(cfg.events.death_ch_a)
-        self._ev_death_b_var.set(cfg.events.death_ch_b)
-        self._ev_death_dur_var.set(cfg.events.death_duration)
-        self._ev_death_wf_a_var.set(cfg.events.death_wf_a)
-        self._ev_death_wf_b_var.set(cfg.events.death_wf_b)
+    def _save_event_controls(self, prefix: str, config, kind: str) -> None:
+        """从一组控件保存事件配置。"""
+        setattr(config, f"{kind}_enabled", getattr(self, f"{prefix}_enabled").isChecked())
+        setattr(config, f"{kind}_ch_a", getattr(self, f"{prefix}_a").value())
+        setattr(config, f"{kind}_ch_b", getattr(self, f"{prefix}_b").value())
+        setattr(config, f"{kind}_duration", getattr(self, f"{prefix}_duration").value())
+        setattr(config, f"{kind}_wf_a", getattr(self, f"{prefix}_wf_a").currentText())
+        setattr(config, f"{kind}_wf_b", getattr(self, f"{prefix}_wf_b").currentText())
 
-        te = cfg.tank_events
-        self._tk_ev_name.set(te.player_name)
-        self._tk_ev_kill_on.set(te.kill_enabled)
-        self._tk_ev_kill_a.set(te.kill_ch_a)
-        self._tk_ev_kill_b.set(te.kill_ch_b)
-        self._tk_ev_kill_dur.set(te.kill_duration)
-        self._tk_ev_kill_wf_a.set(te.kill_wf_a)
-        self._tk_ev_kill_wf_b.set(te.kill_wf_b)
-        self._tk_ev_death_on.set(te.death_enabled)
-        self._tk_ev_death_a.set(te.death_ch_a)
-        self._tk_ev_death_b.set(te.death_ch_b)
-        self._tk_ev_death_dur.set(te.death_duration)
-        self._tk_ev_death_wf_a.set(te.death_wf_a)
-        self._tk_ev_death_wf_b.set(te.death_wf_b)
-        self._tk_ev_repair_on.set(te.repair_enabled)
-        self._tk_ev_repair_a.set(te.repair_ch_a)
-        self._tk_ev_repair_b.set(te.repair_ch_b)
-        self._tk_ev_repair_wf_a.set(te.repair_wf_a)
-        self._tk_ev_repair_wf_b.set(te.repair_wf_b)
+    def _on_save(self) -> None:
+        """保存所有既有设置字段。"""
+        protocol = self._connection_widget.get_protocol()
+        relay_url = self._connection_widget.v4_relay_url.text().strip()
+        if protocol == "v4":
+            parsed_relay = urlsplit(relay_url)
+            if parsed_relay.scheme not in {"ws", "wss"} or not parsed_relay.netloc:
+                self._show_feedback("Relay 地址无效")
+                self._connection_widget.v4_relay_url.setFocus()
+                return
 
-        self._on_mode_changed()
-
-    def _on_save(self):
-        """保存设置"""
         cfg = self._config_mgr.config
+        ac = cfg.aircraft
+        ac.enabled = self.ac_enabled.isChecked()
+        ac.gforce_min = self.gforce_min.value()
+        ac.gforce_max = self.gforce_max.value()
+        ac.channel_a_max = self.ac_ch_a.value()
+        ac.channel_b_max = self.ac_ch_b.value()
+        ac.waveform_a = self.ac_wf_a.currentText()
+        ac.waveform_b = self.ac_wf_b.currentText()
+        ac.random_interval = self.ac_wf_interval.value()
 
-        cfg.aircraft.enabled = self._ac_enabled.get()
-        cfg.aircraft.gforce_min = self._gforce_min.get()
-        cfg.aircraft.gforce_max = self._gforce_max.get()
-        cfg.aircraft.channel_a_max = self._ac_ch_a.get()
-        cfg.aircraft.channel_b_max = self._ac_ch_b.get()
+        tank = cfg.tank
+        tank.enabled = self.tank_enabled.isChecked()
+        tank.speed_min = self.speed_min.value()
+        tank.speed_max = self.speed_max.value()
+        tank.channel_a_max = self.tank_ch_a.value()
+        tank.channel_b_max = self.tank_ch_b.value()
+        tank.waveform_a = self.tank_wf_a.currentText()
+        tank.waveform_b = self.tank_wf_b.currentText()
+        tank.random_interval = self.tank_wf_interval.value()
 
-        cfg.tank.enabled = self._tk_enabled.get()
-        cfg.tank.speed_min = self._speed_min.get()
-        cfg.tank.speed_max = self._speed_max.get()
-        cfg.tank.channel_a_max = self._tk_ch_a.get()
-        cfg.tank.channel_b_max = self._tk_ch_b.get()
+        cas = cfg.cas
+        cas.gforce_min = self.cas_gforce_min.value()
+        cas.gforce_max = self.cas_gforce_max.value()
+        cas.channel_a_max = self.cas_ch_a.value()
+        cas.channel_b_max = self.cas_ch_b.value()
+        cas.waveform_a = self.cas_wf_a.currentText()
+        cas.waveform_b = self.cas_wf_b.currentText()
+        cas.random_interval = self.cas_wf_interval.value()
 
-        cfg.cas.gforce_min = self._cas_gforce_min.get()
-        cfg.cas.gforce_max = self._cas_gforce_max.get()
-        cfg.cas.channel_a_max = self._cas_ch_a.get()
-        cfg.cas.channel_b_max = self._cas_ch_b.get()
+        cfg.events.player_name = self.air_event_name.text().strip()
+        self._save_event_controls("air_kill", cfg.events, "kill")
+        self._save_event_controls("air_death", cfg.events, "death")
+        cfg.tank_events.player_name = self.tank_event_name.text().strip()
+        self._save_event_controls("tank_kill", cfg.tank_events, "kill")
+        self._save_event_controls("tank_death", cfg.tank_events, "death")
+        cfg.tank_events.repair_enabled = self.tank_repair_enabled.isChecked()
+        cfg.tank_events.repair_ch_a = self.tank_repair_a.value()
+        cfg.tank_events.repair_ch_b = self.tank_repair_b.value()
+        cfg.tank_events.repair_wf_a = self.tank_repair_wf_a.currentText()
+        cfg.tank_events.repair_wf_b = self.tank_repair_wf_b.currentText()
 
-        cfg.app.ws_port = self._ws_port.get()
-        cfg.app.refresh_interval_ms = self._refresh_ms.get()
-        cfg.app.mode = self._mode_var.get()
-        cfg.app.overlay_enabled = self._overlay_var.get() if self._overlay_var else False
-        cfg.app.overlay_size = "中"  # 由 Dashboard 控制，不在此保存
-        cfg.tank.waveform_a = self._tk_wf_a.get()
-        cfg.tank.waveform_b = self._tk_wf_b.get()
-        cfg.tank.random_interval = self._tk_wf_interval.get()
-        cfg.cas.waveform_a = self._cas_wf_a.get()
-        cfg.cas.waveform_b = self._cas_wf_b.get()
-        cfg.cas.random_interval = self._cas_wf_interval.get()
-
-        cfg.events.player_name = self._ev_name_var.get()
-        cfg.events.kill_enabled = self._ev_kill_on_var.get()
-        cfg.events.kill_ch_a = self._ev_kill_a_var.get()
-        cfg.events.kill_ch_b = self._ev_kill_b_var.get()
-        cfg.events.kill_duration = self._ev_kill_dur_var.get()
-        cfg.events.kill_wf_a = self._ev_kill_wf_a_var.get()
-        cfg.events.kill_wf_b = self._ev_kill_wf_b_var.get()
-        cfg.events.death_enabled = self._ev_death_on_var.get()
-        cfg.events.death_ch_a = self._ev_death_a_var.get()
-        cfg.events.death_ch_b = self._ev_death_b_var.get()
-        cfg.events.death_duration = self._ev_death_dur_var.get()
-        cfg.events.death_wf_a = self._ev_death_wf_a_var.get()
-        cfg.events.death_wf_b = self._ev_death_wf_b_var.get()
-
-        te = cfg.tank_events
-        te.player_name = self._tk_ev_name.get()
-        te.kill_enabled = self._tk_ev_kill_on.get()
-        te.kill_ch_a = self._tk_ev_kill_a.get()
-        te.kill_ch_b = self._tk_ev_kill_b.get()
-        te.kill_duration = self._tk_ev_kill_dur.get()
-        te.kill_wf_a = self._tk_ev_kill_wf_a.get()
-        te.kill_wf_b = self._tk_ev_kill_wf_b.get()
-        te.death_enabled = self._tk_ev_death_on.get()
-        te.death_ch_a = self._tk_ev_death_a.get()
-        te.death_ch_b = self._tk_ev_death_b.get()
-        te.death_duration = self._tk_ev_death_dur.get()
-        te.death_wf_a = self._tk_ev_death_wf_a.get()
-        te.death_wf_b = self._tk_ev_death_wf_b.get()
-        te.repair_enabled = self._tk_ev_repair_on.get()
-        te.repair_ch_a = self._tk_ev_repair_a.get()
-        te.repair_ch_b = self._tk_ev_repair_b.get()
-        te.repair_wf_a = self._tk_ev_repair_wf_a.get()
-        te.repair_wf_b = self._tk_ev_repair_wf_b.get()
-
+        cfg.app.ws_port = self._connection_widget.ws_port.value()
+        cfg.app.dglab_protocol = protocol
+        cfg.app.v4_relay_url = (
+            relay_url or "wss://trex.dungeon-lab.cn/v4"
+        )
+        cfg.app.refresh_interval_ms = self._dashboard_widget.refresh_ms.value()
+        cfg.app.mode = self.get_mode()
+        if self._overlay_var:
+            cfg.app.overlay_enabled = self._overlay_var.get()
+        if self._overlay_size_var:
+            cfg.app.overlay_size = self._overlay_size_var.get()
         self._config_mgr.save()
-
-        # 反馈
-        self.save_feedback.config(text="✓ 已保存")
-        self.after(2000, lambda: self.save_feedback.config(text=""))
-
+        self._show_feedback("已保存")
         if self._on_save_callback:
             self._on_save_callback()
 
-    def _on_reset(self):
-        """恢复默认"""
+    def _on_reset(self) -> None:
+        """恢复默认配置并刷新控件。"""
         self._config_mgr.reset_defaults()
         self._load_config()
         self._config_mgr.save()
-        self.save_feedback.config(text="✓ 已恢复默认")
-        self.after(2000, lambda: self.save_feedback.config(text=""))
+        self._show_feedback("已恢复默认")
+        if self._on_save_callback:
+            self._on_save_callback()
+
+    def _show_feedback(self, text: str) -> None:
+        """短暂显示保存反馈。"""
+        self.save_feedback.setText(text)
+        QTimer.singleShot(1800, lambda: self.save_feedback.setText(""))
 
 
-class QRWidget(ttk.LabelFrame):
-    """QR 码区域 — 生成并显示连接二维码"""
+class QRWidget(QFrame):
+    """设备二维码与连接状态面板。"""
 
-    def __init__(self, parent):
-        super().__init__(parent, text="设备连接")
+    def __init__(self, parent: QWidget,
+                 on_protocol_changed: Callable | None = None):
+        super().__init__(parent)
+        self.setObjectName("connectionPanel")
+        self._qr_image_ref: QPixmap | None = None
+        self._protocol = "v3"
+        self._on_protocol_changed = on_protocol_changed
         self._build()
 
-    def _build(self):
-        inner = ttk.Frame(self, style="Card.TFrame")
-        inner.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+    def _build(self) -> None:
+        """创建二维码和连接状态控件。"""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(10)
+        eyebrow = QLabel("DEVICE CONNECTION")
+        eyebrow.setObjectName("eyebrow")
+        title = QLabel("连接郊狼")
+        title.setObjectName("sectionTitle")
+        layout.addWidget(eyebrow)
+        layout.addWidget(title)
 
-        # 左侧：QR 码占位
-        self.qr_canvas = tk.Canvas(inner, width=120, height=120,
-                                   bg="white", highlightthickness=2,
-                                   highlightbackground=COLORS["border"])
-        self.qr_canvas.pack(side=tk.LEFT, padx=(0, 16))
-        self.qr_canvas.create_text(60, 60, text="等待\n启动...",
-                                   fill=COLORS["text_secondary"],
-                                   font=FONTS["small"])
+        self.qr_frame = QFrame()
+        self.qr_frame.setObjectName("qrFrame")
+        qr_layout = QVBoxLayout(self.qr_frame)
+        qr_layout.setContentsMargins(12, 12, 12, 12)
+        self.qr_canvas = QLabel("二维码\n等待启动")
+        self.qr_canvas.setObjectName("qrImage")
+        self.qr_canvas.setAlignment(Qt.AlignCenter)
+        self.qr_canvas.setMinimumSize(176, 176)
+        qr_layout.addWidget(self.qr_canvas)
+        layout.addWidget(self.qr_frame)
 
-        # 右侧：连接信息
-        info_frame = ttk.Frame(inner, style="Card.TFrame")
-        info_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.status_text = QLabel("等待 WebSocket 服务启动...")
+        self.status_text.setObjectName("sectionTitle")
+        self.status_text.setWordWrap(True)
+        self.url_text = QLabel("")
+        self.url_text.setObjectName("addressText")
+        self.url_text.setWordWrap(True)
+        self.url_text.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.status_text)
+        layout.addWidget(self.url_text)
 
-        self.status_text = tk.Label(info_frame, text="等待启动 WebSocket 服务...",
-                                    fg=COLORS["text_primary"], bg=COLORS["bg_card"],
-                                    font=FONTS["default"])
-        self.status_text.pack(anchor=tk.W)
+        connection_card = QFrame()
+        connection_card.setObjectName("sectionCard")
+        connection_layout = QVBoxLayout(connection_card)
+        connection_layout.setContentsMargins(12, 12, 12, 12)
+        connection_layout.setSpacing(7)
+        connection_title = QLabel("连接设置")
+        connection_title.setObjectName("sectionTitle")
+        connection_hint = QLabel("协议与服务地址")
+        connection_hint.setObjectName("hintText")
 
-        self.url_label = tk.Label(info_frame, text="",
-                                  fg=COLORS["primary"], bg=COLORS["bg_main"],
-                                  font=("Consolas", 10, "bold"),
-                                  padx=8, pady=4, anchor=tk.W)
-        self.url_label.pack(anchor=tk.W, pady=4)
+        protocol_row = QFrame()
+        protocol_row.setObjectName("protocolSelector")
+        protocol_layout = QHBoxLayout(protocol_row)
+        protocol_layout.setContentsMargins(4, 4, 4, 4)
+        protocol_layout.setSpacing(4)
+        self.v3_button = QToolButton()
+        self.v3_button.setObjectName("modeButton")
+        self.v3_button.setText("V3 App")
+        self.v3_button.setCheckable(True)
+        self.v4_button = QToolButton()
+        self.v4_button.setObjectName("modeButton")
+        self.v4_button.setText("V4 App")
+        self.v4_button.setCheckable(True)
+        self._protocol_group = QButtonGroup(self)
+        self._protocol_group.setExclusive(True)
+        self._protocol_group.addButton(self.v3_button)
+        self._protocol_group.addButton(self.v4_button)
+        self.v3_button.clicked.connect(
+            lambda: self._apply_protocol_choice("v3")
+        )
+        self.v4_button.clicked.connect(
+            lambda: self._apply_protocol_choice("v4")
+        )
+        protocol_layout.addWidget(self.v3_button)
+        protocol_layout.addWidget(self.v4_button)
 
-        hint = tk.Label(info_frame,
-                        text="① 确保手机和电脑在同一局域网\n"
-                             "② 打开 DG-LAB App → Socket被控 → 扫码连接\n"
-                             "③ 连接成功后保持App在前台，勿锁屏\n"
-                             "④ 断开后可点「刷新二维码」重新连接",
-                        fg=COLORS["text_secondary"], bg=COLORS["bg_card"],
-                        font=FONTS["small"], justify=tk.LEFT)
-        hint.pack(anchor=tk.W, pady=(8, 0))
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(7)
+        self.ws_port = NoWheelSpinBox()
+        self.ws_port.setObjectName("wsPortInput")
+        self.ws_port.setRange(1024, 65535)
+        self.v4_relay_url = QLineEdit()
+        self.v4_relay_url.setObjectName("v4RelayUrlInput")
+        self.v4_relay_url.setPlaceholderText(
+            "wss://trex.dungeon-lab.cn/v4"
+        )
+        self.port_label = QLabel("本机服务端端口")
+        self.port_label.setObjectName("formLabel")
+        self.relay_label = QLabel("V4 Relay")
+        self.relay_label.setObjectName("formLabel")
+        form.addRow(self.port_label, self.ws_port)
+        form.addRow(self.relay_label, self.v4_relay_url)
+        connection_layout.addWidget(connection_title)
+        connection_layout.addWidget(connection_hint)
+        connection_layout.addWidget(protocol_row)
+        connection_layout.addLayout(form)
+        layout.addWidget(connection_card)
+        layout.addStretch()
 
-    def set_status(self, text: str, url: str = ""):
-        self.status_text.config(text=text)
-        if url:
-            self.url_label.config(text=f"📡 {url}")
-        else:
-            self.url_label.config(text="")
+    def set_protocol(self, protocol: str) -> None:
+        """切换 V3/V4 设置项的显示状态。"""
+        is_v4 = protocol == "v4"
+        self._protocol = "v4" if is_v4 else "v3"
+        self.v3_button.setChecked(not is_v4)
+        self.v4_button.setChecked(is_v4)
+        self.port_label.setVisible(not is_v4)
+        self.ws_port.setVisible(not is_v4)
+        self.relay_label.setVisible(is_v4)
+        self.v4_relay_url.setVisible(is_v4)
+
+    def get_protocol(self) -> str:
+        """返回当前选择的 DG-LAB App 协议。"""
+        return self._protocol
+
+    def _apply_protocol_choice(self, protocol: str) -> None:
+        """即时应用用户点击的协议，失败时恢复原选择。"""
+        previous = self._protocol
+        self.set_protocol(protocol)
+        if (self._on_protocol_changed
+                and self._on_protocol_changed(protocol) is False):
+            self.set_protocol(previous)
+
+    def set_qr_image(self, image) -> None:
+        """将 Pillow 图片转换为 QPixmap 并显示。"""
+        rgba = image.convert("RGBA").resize((160, 160))
+        qimage = QImage(
+            rgba.tobytes("raw", "RGBA"),
+            rgba.width,
+            rgba.height,
+            rgba.width * 4,
+            QImage.Format_RGBA8888,
+        ).copy()
+        self._qr_image_ref = QPixmap.fromImage(qimage)
+        self.qr_canvas.setPixmap(self._qr_image_ref)
+        self.qr_canvas.setText("")
+
+    def clear_qr_image(self) -> None:
+        """清除旧协议二维码并恢复等待占位。"""
+        self._qr_image_ref = None
+        self.qr_canvas.clear()
+        self.qr_canvas.setText("二维码\n等待启动")
+
+    def set_status(self, text: str, url: str = "") -> None:
+        """更新连接状态，连接成功后收起二维码。"""
+        self.status_text.setText(text)
+        self.url_text.setText(url)
+        self.qr_frame.setVisible("已连接" not in text)
 
 
-class MainWindow:
-    """主窗口控制器 — 组装所有面板"""
+class MainWindow(QMainWindow):
+    """PySide6 主窗口控制器。"""
 
-    def __init__(self, config_manager: ConfigManager, on_mode_changed=None):
+    def __init__(self, config_manager: ConfigManager,
+                 on_mode_changed: Callable | None = None):
+        _set_windows_app_id()
+        existing = QApplication.instance()
+        self._app = existing or QApplication(sys.argv)
+        setup_styles(self._app)
+        super().__init__()
+        self.root = self
+        self.setObjectName("appWindow")
+        self.setWindowTitle("郊狼雷霆 v1 beta")
+        app_icon = QIcon(_resource_path("tubiao.ico"))
+        if not app_icon.isNull():
+            self.setWindowIcon(app_icon)
+            self._app.setWindowIcon(app_icon)
+        self.resize(1280, 780)
+        self.setMinimumSize(1080, 660)
         self._config_mgr = config_manager
         self._on_mode_changed = on_mode_changed
-
-        self.root = tk.Tk()
-        self.root.title("郊狼雷霆 v0.1")
-        self.root.geometry("1000x700")
-        self.root.minsize(940, 650)
-        self.root.configure(bg=COLORS["bg_main"])
-
-        # 设置 ttk 样式
-        setup_styles()
-
+        self._close_callback: Callable | None = None
         self._build()
-        self._center_window()
 
-    def _build(self):
-        # === 顶部状态栏 ===
-        self.status_bar = StatusBar(self.root)
-        self.status_bar.pack(fill=tk.X, padx=8, pady=(8, 0))
+    def _build(self) -> None:
+        """组装主界面的三栏布局。"""
+        surface = QWidget()
+        surface.setObjectName("appSurface")
+        self.setCentralWidget(surface)
+        layout = QVBoxLayout(surface)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
 
-        # === 分隔线 ===
-        ttk.Separator(self.root, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=8, pady=4)
+        self.status_bar = StatusBar(surface)
+        layout.addWidget(self.status_bar)
 
-        # === 主体（左右两栏） ===
-        body = ttk.Frame(self.root, style="Panel.TFrame")
-        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setObjectName("mainSplitter")
+        self.dashboard = Dashboard(splitter)
+        self.dashboard.set_overlay_enabled(self._config_mgr.config.app.overlay_enabled)
+        self.dashboard.set_overlay_size(self._config_mgr.config.app.overlay_size)
+        self.qr_widget = QRWidget(
+            splitter,
+            on_protocol_changed=self._apply_protocol_immediately,
+        )
+        self.settings_panel = SettingsPanel(
+            splitter,
+            self._config_mgr,
+            on_save=self._on_settings_saved,
+            on_mode_changed=self._on_mode_changed,
+            overlay_var=self.dashboard.overlay_var,
+            overlay_size_var=self.dashboard._overlay_size_var,
+            connection_widget=self.qr_widget,
+            dashboard_widget=self.dashboard,
+        )
+        splitter.addWidget(self.dashboard)
+        splitter.addWidget(self.settings_panel)
+        splitter.addWidget(self.qr_widget)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([295, 620, 285])
+        layout.addWidget(splitter, 1)
 
-        # 左侧：仪表盘
-        self.dashboard = Dashboard(body)
-        self.dashboard.pack(side=tk.LEFT, fill=tk.BOTH, padx=(0, 6))
-        # 确保宽度足够容纳三位数强度值
-        self.dashboard.configure(width=180)
-        self.dashboard.overlay_var.set(
-            self._config_mgr.config.app.overlay_enabled)
-        self.dashboard._overlay_size_var.set(
-            self._config_mgr.config.app.overlay_size)
-
-        # 右侧：设置面板
-        self.settings_panel = SettingsPanel(body, self._config_mgr,
-                                            on_save=self._on_settings_saved,
-                                            on_mode_changed=self._on_mode_changed,
-                                            overlay_var=self.dashboard.overlay_var)
-        self.settings_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        # === 底部 QR 码区域 ===
-        ttk.Separator(self.root, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=8, pady=2)
-        self.qr_widget = QRWidget(self.root)
-        self.qr_widget.pack(fill=tk.X, padx=8, pady=(2, 8))
-
-    def _center_window(self):
-        self.root.update_idletasks()
-        w = self.root.winfo_width()
-        h = self.root.winfo_height()
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        x = (sw - w) // 2
-        y = (sh - h) // 2
-        self.root.geometry(f"+{x}+{y}")
-
-    def _on_settings_saved(self):
-        """设置变更回调 — 通知 App 同步波形等配置"""
+    def _on_settings_saved(self) -> None:
+        """设置保存后通知业务控制器。"""
         if self._on_mode_changed:
             self._on_mode_changed()
 
+    def _apply_protocol_immediately(self, protocol: str) -> bool:
+        """持久化协议选择并立即通知业务控制器重建连接。"""
+        cfg = self._config_mgr.config.app
+        if protocol == "v4":
+            relay_url = self.qr_widget.v4_relay_url.text().strip()
+            parsed_relay = urlsplit(relay_url)
+            if (parsed_relay.scheme not in {"ws", "wss"}
+                    or not parsed_relay.netloc):
+                self.qr_widget.set_status("⚠ Relay 地址无效")
+                self.qr_widget.v4_relay_url.setFocus()
+                return False
+            cfg.v4_relay_url = relay_url
+        else:
+            cfg.ws_port = self.qr_widget.ws_port.value()
+
+        if cfg.dglab_protocol == protocol:
+            return True
+        cfg.dglab_protocol = protocol
+        self._config_mgr.save()
+        if self._on_mode_changed:
+            self._on_mode_changed()
+        return True
+
+    def set_close_callback(self, callback: Callable) -> None:
+        """设置用户关闭主窗口时的清理回调。"""
+        self._close_callback = callback
+
     def get_mode(self) -> str:
+        """返回当前模式。"""
         return self.settings_panel.get_mode()
 
     @property
     def overlay_enabled(self) -> bool:
-        return self._overlay_var.get()
+        """返回悬浮窗是否开启。"""
+        return self.dashboard.overlay_var.get()
 
     @property
     def overlay_size(self) -> str:
+        """返回悬浮窗大小设置。"""
         return self.dashboard._overlay_size_var.get()
 
     def get_config(self):
+        """返回当前配置对象。"""
         return self._config_mgr.config
 
-    def run(self):
-        """启动主循环"""
-        self.root.mainloop()
+    def run(self) -> int:
+        """显示窗口并进入 Qt 主事件循环。"""
+        self.show()
+        return self._app.exec()
 
-    def after(self, ms, callback):
-        """定时器"""
-        self.root.after(ms, callback)
+    def after(self, ms: int, callback: Callable) -> None:
+        """兼容旧控制器的延迟回调接口。"""
+        QTimer.singleShot(ms, callback)
 
-    def quit(self):
-        self.root.quit()
+    def quit(self) -> None:
+        """关闭窗口和 Qt 事件循环。"""
+        self._close_callback = None
+        self.hide()
+        self._app.quit()
+
+    def closeEvent(self, event) -> None:
+        """将窗口关闭操作交给主控制器清理资源。"""
+        if self._close_callback:
+            callback = self._close_callback
+            event.ignore()
+            QTimer.singleShot(0, callback)
+            return
+        event.accept()

@@ -3,6 +3,7 @@
 import json
 import os
 from dataclasses import dataclass, field, asdict
+from urllib.parse import urlsplit
 
 
 @dataclass
@@ -88,10 +89,13 @@ class TankEventSettings:
 class AppSettings:
     """应用全局设置"""
     ws_port: int = 8765              # WebSocket 服务端口
+    dglab_protocol: str = "v3"       # DG-LAB App 协议: "v3" / "v4"
+    v4_relay_url: str = "wss://trex.dungeon-lab.cn/v4"
     refresh_interval_ms: int = 200   # 数据刷新间隔(毫秒)
     mode: str = "aircraft"           # 当前模式: "aircraft" 或 "tank"
     overlay_enabled: bool = False    # 悬浮窗开关
     overlay_size: str = "中"          # 悬浮窗大小
+    notice_accepted: bool = False     # 是否已同意注意事项
 
 
 @dataclass
@@ -158,6 +162,9 @@ class ConfigManager:
                 gforce_max=float(ac.get("gforce_max", 10.0)),
                 channel_a_max=int(ac.get("channel_a_max", 0)),
                 channel_b_max=int(ac.get("channel_b_max", 0)),
+                waveform_a=str(ac.get("waveform_a", "恒定")),
+                waveform_b=str(ac.get("waveform_b", "恒定")),
+                random_interval=int(ac.get("random_interval", 30)),
             )
         if "tank" in data:
             tk = data["tank"]
@@ -223,10 +230,23 @@ class ConfigManager:
             )
         if "app" in data:
             ap = data["app"]
+            protocol = str(ap.get("dglab_protocol", "v3")).lower()
+            relay_url = str(ap.get(
+                "v4_relay_url", "wss://trex.dungeon-lab.cn/v4"
+            )).strip()
+            parsed_relay = urlsplit(relay_url)
+            if (parsed_relay.scheme not in {"ws", "wss"}
+                    or not parsed_relay.netloc):
+                relay_url = "wss://trex.dungeon-lab.cn/v4"
             self._config.app = AppSettings(
                 ws_port=int(ap.get("ws_port", 8765)),
+                dglab_protocol=(
+                    protocol if protocol in {"v3", "v4"} else "v3"
+                ),
+                v4_relay_url=relay_url,
                 refresh_interval_ms=int(ap.get("refresh_interval_ms", 200)),
                 mode=str(ap.get("mode", "aircraft")),
                 overlay_enabled=bool(ap.get("overlay_enabled", False)),
                 overlay_size=str(ap.get("overlay_size", "中")),
+                notice_accepted=bool(ap.get("notice_accepted", False)),
             )

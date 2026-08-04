@@ -64,6 +64,7 @@ class CoyoteController:
         # 后台线程
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._main_task: Optional[asyncio.Task] = None
         self._running = False
 
         # PyDGLab-WS 对象（在 asyncio 线程中创建）
@@ -86,7 +87,13 @@ class CoyoteController:
 
     @property
     def status(self) -> CoyoteStatus:
+        """返回当前 V3 服务与 App 绑定状态。"""
         return self._status
+
+    @property
+    def port(self) -> int:
+        """返回本机 V3 WebSocket 服务端口。"""
+        return self._port
 
     def start(self) -> bool:
         """启动 WebSocket 服务端（阻塞直到服务启动或超时）
@@ -112,8 +119,8 @@ class CoyoteController:
     def stop(self):
         """停止服务端"""
         self._running = False
-        if self._loop:
-            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._loop and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._cancel_main_task)
 
     def get_qrcode_url(self, ip: str = "") -> str:
         """获取二维码 URL（由 PyDGLab-WS 客户端生成，非简单 ws:// 地址）
@@ -186,15 +193,33 @@ class CoyoteController:
         self._loop = loop
 
         try:
-            loop.run_until_complete(self._async_main())
+            self._main_task = loop.create_task(self._async_main())
+            loop.run_until_complete(self._main_task)
+        except asyncio.CancelledError:
+            pass
         except Exception as e:
             logger.error(f"后台线程异常: {e}")
             self._status.error = str(e)
         finally:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+            self._main_task = None
             self._status.server_running = False
+            self._status.client_connected = False
+            self._status.bound = False
             self._running = False
             loop.close()
             logger.info("郊狼服务端已停止")
+
+    def _cancel_main_task(self) -> None:
+        """在 V3 事件循环线程中取消服务主协程。"""
+        if self._main_task and not self._main_task.done():
+            self._main_task.cancel()
 
     async def _async_main(self):
         """异步主函数 — 官方 Socket 协议流程"""
