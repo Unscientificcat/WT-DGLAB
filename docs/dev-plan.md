@@ -55,7 +55,7 @@
 - [x] 端到端模块集成（main.py App 类）
 - [x] 异常状态处理（WT未运行 → 零强度、设备断连 → 忽略指令）
 - [x] PyInstaller 打包脚本（build.py）
-- [x] 自动回归测试（34 项通过）
+- [x] 自动回归测试（37 项通过）
 - [x] 实际 PyInstaller 打包（`WT-DGLAB.exe`）
 - [x] 重写 GitHub README，并补充 `v1 beta` 相对 `v0.1` 的更新日志
 - [ ] 游戏内实测（需要战争雷霆 + 郊狼设备）

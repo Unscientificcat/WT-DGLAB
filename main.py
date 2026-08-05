@@ -110,6 +110,9 @@ class App:
 
     def run(self):
         """启动应用"""
+        # 先将主窗口带到前台，避免模态注意事项附着在隐藏父窗口上。
+        self.window.show_startup()
+
         # 首次启动显示注意事项
         if not self._cfg.app.notice_accepted:
             if not self._show_disclaimer_dialog():

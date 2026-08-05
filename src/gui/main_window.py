@@ -6,7 +6,7 @@ import sys
 from typing import Callable
 from urllib.parse import urlsplit
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -1072,6 +1072,7 @@ class MainWindow(QMainWindow):
         self._config_mgr = config_manager
         self._on_mode_changed = on_mode_changed
         self._close_callback: Callable | None = None
+        self._startup_topmost = False
         self._build()
 
     def _build(self) -> None:
@@ -1166,8 +1167,45 @@ class MainWindow(QMainWindow):
 
     def run(self) -> int:
         """显示窗口并进入 Qt 主事件循环。"""
-        self.show()
+        self.show_startup()
         return self._app.exec()
+
+    def show_startup(self) -> None:
+        """在启动阶段临时置顶并请求 Windows 激活窗口。"""
+        self._startup_topmost = True
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        self.showNormal()
+        self._request_startup_activation()
+        QTimer.singleShot(0, self._request_startup_activation)
+        QTimer.singleShot(15000, self._release_startup_topmost)
+
+    def _request_startup_activation(self) -> None:
+        """提升主窗口并向桌面窗口管理器请求前台焦点。"""
+        if not self.isVisible():
+            return
+        self.raise_()
+        self.activateWindow()
+        handle = self.windowHandle()
+        if handle is not None:
+            handle.requestActivate()
+
+    def _release_startup_topmost(self) -> None:
+        """获得关注后解除启动置顶，避免持续遮挡游戏。"""
+        if not self._startup_topmost:
+            return
+        was_active = self.isActiveWindow()
+        self._startup_topmost = False
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
+        self.showNormal()
+        if was_active:
+            self._request_startup_activation()
+
+    def event(self, event) -> bool:
+        """窗口激活后延迟解除启动置顶状态。"""
+        if (event.type() == QEvent.WindowActivate
+                and getattr(self, "_startup_topmost", False)):
+            QTimer.singleShot(500, self._release_startup_topmost)
+        return super().event(event)
 
     def after(self, ms: int, callback: Callable) -> None:
         """兼容旧控制器的延迟回调接口。"""

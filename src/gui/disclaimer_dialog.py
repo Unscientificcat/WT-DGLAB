@@ -5,7 +5,7 @@ import os
 import re
 import sys
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -45,14 +45,15 @@ def _format_notice(content: str) -> str:
     return escaped.replace("\n", "<br>")
 
 
-def show_disclaimer_dialog(parent: QWidget | None) -> bool:
-    """显示注意事项，返回用户是否确认。"""
+def _create_disclaimer_dialog(parent: QWidget | None) -> QDialog:
+    """创建应用模态且在显示期间置顶的注意事项对话框。"""
     dialog = QDialog(parent)
     dialog.setObjectName("disclaimerDialog")
     dialog.setWindowTitle("注意事项 - 郊狼雷霆")
     dialog.setMinimumSize(460, 380)
     dialog.resize(620, 560)
     dialog.setModal(True)
+    dialog.setWindowFlag(Qt.WindowStaysOnTopHint, True)
 
     layout = QVBoxLayout(dialog)
     layout.setContentsMargins(24, 24, 24, 20)
@@ -82,4 +83,22 @@ def show_disclaimer_dialog(parent: QWidget | None) -> bool:
     confirm.clicked.connect(dialog.accept)
     confirm.setDefault(True)
     confirm.setFocus()
+    return dialog
+
+
+def _activate_dialog(dialog: QDialog) -> None:
+    """将已经显示的注意事项提升到前台。"""
+    if not dialog.isVisible():
+        return
+    dialog.raise_()
+    dialog.activateWindow()
+    handle = dialog.windowHandle()
+    if handle is not None:
+        handle.requestActivate()
+
+
+def show_disclaimer_dialog(parent: QWidget | None) -> bool:
+    """显示注意事项，返回用户是否确认。"""
+    dialog = _create_disclaimer_dialog(parent)
+    QTimer.singleShot(0, lambda: _activate_dialog(dialog))
     return dialog.exec() == QDialog.Accepted
