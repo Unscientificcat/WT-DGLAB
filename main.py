@@ -1,4 +1,4 @@
-"""郊狼雷霆 v1 beta — 战争雷霆 × 郊狼 3.0 电击联动
+"""郊狼雷霆 v1 beta_1 — 战争雷霆 × 郊狼 3.0 电击联动
 
 启动方式：
     python main.py
@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import qrcode
 from PIL import Image
+from PySide6.QtWidgets import QApplication
 
 from src.config_manager import ConfigManager
 from src.event_detector import EventDetector
@@ -30,6 +31,7 @@ from src.mapping_engine import MappingEngine
 from src.gui.disclaimer_dialog import show_disclaimer_dialog
 from src.gui.main_window import MainWindow
 from src.gui.overlay import OverlayWindow
+from src.single_instance import SingleInstance
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,15 +41,36 @@ logging.basicConfig(
 logger = logging.getLogger("WT-DGLAB")
 
 
+def _application_directory() -> str:
+    """返回源码项目目录或打包后 EXE 所在目录。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _config_file_path() -> str:
+    """返回与 EXE 同目录的配置文件路径。"""
+    return os.path.join(_application_directory(), "config.json")
+
+
+def _load_config_manager() -> ConfigManager:
+    """加载同目录配置，并在首次启动时创建默认配置文件。"""
+    config_path = _config_file_path()
+    config_exists = os.path.isfile(config_path)
+    manager = ConfigManager(config_path)
+    manager.load()
+    if not config_exists:
+        manager.save()
+        logger.info(f"已生成默认配置: {config_path}")
+    return manager
+
+
 class App:
     """应用主控制器 — 后台线程读取游戏数据，主线程只负责更新 GUI"""
 
     def __init__(self):
         # ===== 配置 =====
-        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   "config.json")
-        self.config_mgr = ConfigManager(config_path)
-        self.config_mgr.load()
+        self.config_mgr = _load_config_manager()
 
         # ===== 状态缓存（必须在 GUI 之前初始化，因为 GUI 初始化会触发回调）=====
         self._last_state = GameState()
@@ -139,7 +162,9 @@ class App:
         self.window.run()
 
     def _on_close(self):
-        """窗口关闭回调 — 立即关闭，不等待后台资源释放"""
+        """托盘退出回调 — 保存配置并清理后台资源。"""
+        self.window.save_current_settings()
+        self.config_mgr.save()
         self._running = False
         self.coyote.clear_all()
         self.coyote.stop()
@@ -191,6 +216,7 @@ class App:
                 self._current_mode,
                 self._cfg.events,
                 self._cfg.tank_events,
+                self._cfg.cas.enabled,
             )
             if not event:
                 return
@@ -253,11 +279,7 @@ class App:
                         and not self._last_state.tank.is_repairing):
                     self._event_remaining = 0
                 if self._event_remaining <= 0:
-                    self._event_remaining = 0
-                    self._event_kind = ""
-                    self.window.dashboard.show_event("")
-                    self._apply_waveform()
-                    logger.info("事件结束，恢复正常映射")
+                    self._finish_active_event()
                 elif self._event_kind == "repair":
                     self.window.dashboard.show_event("🔧 维修中")
                 elif self._event_kind == "kill":
@@ -312,6 +334,12 @@ class App:
             self._sync_overlay(mode, 0, 0)
             return
 
+        cas_active = mode == "tank" and state.vehicle_type == "aircraft"
+        if (cas_active and not cfg.cas.enabled
+                and self._event_mode == "aircraft"
+                and self._event_remaining > 0):
+            self._cancel_active_event("CAS 触发已关闭，取消 CAS 事件输出")
+
         intensity_a = 0
         intensity_b = 0
 
@@ -345,11 +373,12 @@ class App:
                 # 上了飞机 → CAS 设置 + G值触发
                 ac = state.aircraft
                 cas_cfg = cfg.cas
-                self.coyote.set_waveform_a(cas_cfg.waveform_a, cas_cfg.random_interval)
-                self.coyote.set_waveform_b(cas_cfg.waveform_b, cas_cfg.random_interval)
-                intensity_a, intensity_b = MappingEngine.map_aircraft(
-                    ac.gforce, cas_cfg.gforce_min, cas_cfg.gforce_max,
-                    cas_cfg.channel_a_max, cas_cfg.channel_b_max)
+                if cas_cfg.enabled:
+                    self.coyote.set_waveform_a(cas_cfg.waveform_a, cas_cfg.random_interval)
+                    self.coyote.set_waveform_b(cas_cfg.waveform_b, cas_cfg.random_interval)
+                    intensity_a, intensity_b = MappingEngine.map_aircraft(
+                        ac.gforce, cas_cfg.gforce_min, cas_cfg.gforce_max,
+                        cas_cfg.channel_a_max, cas_cfg.channel_b_max)
                 self.window.dashboard.update_aircraft(
                     ac.gforce, intensity_a, intensity_b)
             elif state.vehicle_type == "tank" and state.tank and state.tank.valid:
@@ -383,8 +412,9 @@ class App:
             self._overlay_tick = 0
             self._sync_overlay(mode, intensity_a, intensity_b)
 
-    def _cancel_active_event(self):
-        """在离开有效对局时取消事件覆盖，避免事件强度继续输出。"""
+    def _cancel_active_event(self, reason: str =
+                             "已离开有效对局，取消事件输出并恢复常规波形"):
+        """取消事件覆盖并记录原因，避免事件强度继续输出。"""
         had_event = self._event_remaining > 0 or bool(self._event_kind)
         self._event_kind = ""
         self._event_mode = ""
@@ -395,7 +425,7 @@ class App:
 
         if had_event:
             self._apply_waveform()
-            logger.info("已离开有效对局，取消事件输出并恢复常规波形")
+            logger.info(reason)
 
     def _apply_event(self, ev: dict):
         """应用后台检测到的事件"""
@@ -417,6 +447,44 @@ class App:
         else:
             self.window.dashboard.show_event(f"{label} ({ev['duration']:.1f}s)")
         logger.info(f"事件触发: {label} A={ev['ch_a']} B={ev['ch_b']}")
+
+    def _finish_active_event(self) -> None:
+        """结束当前事件，并在仍维修时从击杀/死亡切回维修输出。"""
+        finished_kind = self._event_kind
+        self._event_kind = ""
+        self._event_mode = ""
+        self._event_ch_a = 0
+        self._event_ch_b = 0
+        self._event_remaining = 0.0
+
+        if (finished_kind in {"kill", "death"}
+                and self._resume_repair_if_active()):
+            logger.info("击杀/死亡事件结束，检测到仍在维修，恢复维修输出")
+            return
+
+        self.window.dashboard.show_event("")
+        self._apply_waveform()
+        logger.info("事件结束，恢复正常映射")
+
+    def _resume_repair_if_active(self) -> bool:
+        """当前坦克仍在维修且功能启用时，立即应用维修事件。"""
+        state = self._last_state
+        tank = state.tank if state.vehicle_type == "tank" else None
+        config = self._cfg.tank_events
+        if (not state.connected or not tank or not tank.valid
+                or not tank.is_repairing or not config.repair_enabled):
+            return False
+
+        self._apply_event({
+            "kind": "repair",
+            "mode": "tank",
+            "ch_a": config.repair_ch_a,
+            "ch_b": config.repair_ch_b,
+            "duration": 60.0,
+            "wf_a": config.repair_wf_a,
+            "wf_b": config.repair_wf_b,
+        })
+        return True
 
     def _on_mode_switched(self):
         """模式切换/设置保存回调 — 刷新仪表盘 + 同步波形"""
@@ -686,8 +754,18 @@ class App:
 
 
 def main():
+    # QApplication 先于单实例服务创建，保证本地 IPC 可以安全监听。
+    qt_app = QApplication.instance() or QApplication(sys.argv)
+    instance = SingleInstance()
+    if not instance.acquire():
+        return
+
     app = App()
-    app.run()
+    instance.set_activate_callback(app.window.restore_from_tray)
+    try:
+        app.run()
+    finally:
+        instance.close()
 
 
 if __name__ == "__main__":

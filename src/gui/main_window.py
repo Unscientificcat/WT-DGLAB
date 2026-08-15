@@ -7,7 +7,7 @@ from typing import Callable
 from urllib.parse import urlsplit
 
 from PySide6.QtCore import QEvent, Qt, QTimer
-from PySide6.QtGui import QIcon, QImage, QPixmap
+from PySide6.QtGui import QAction, QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStackedWidget,
+    QSystemTrayIcon,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -55,7 +57,7 @@ def _set_windows_app_id() -> None:
         return
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "WT-DGLAB.v1-beta.tubiao"
+            "WT-DGLAB.v1-beta_1.tubiao1"
         )
     except (AttributeError, OSError):
         pass
@@ -558,6 +560,8 @@ class SettingsPanel(QFrame):
         layout.addWidget(card)
 
         cas_card, cas_form = self._make_section("CAS 设置", "陆战模式上飞机时使用")
+        self.cas_enabled = QCheckBox("启用 CAS 触发")
+        self.cas_enabled.setObjectName("casEnabled")
         self.cas_gforce_min = self._double_box(0, 20, 0.5, " G")
         self.cas_gforce_max = self._double_box(0, 20, 0.5, " G")
         self.cas_ch_a = self._int_box(0, 200)
@@ -565,6 +569,7 @@ class SettingsPanel(QFrame):
         self.cas_wf_a = self._combo(self._waveforms)
         self.cas_wf_b = self._combo(self._waveforms)
         self.cas_wf_interval = self._int_box(5, 300, " 秒")
+        cas_form.addRow(self.cas_enabled)
         self._add_row(cas_form, "过载下限", self.cas_gforce_min)
         self._add_row(cas_form, "过载上限", self.cas_gforce_max)
         self._add_row(cas_form, "A 通道最大强度", self.cas_ch_a)
@@ -764,6 +769,7 @@ class SettingsPanel(QFrame):
         self.tank_wf_interval.setValue(tank.random_interval)
 
         cas = cfg.cas
+        self.cas_enabled.setChecked(cas.enabled)
         self.cas_gforce_min.setValue(cas.gforce_min)
         self.cas_gforce_max.setValue(cas.gforce_max)
         self.cas_ch_a.setValue(cas.channel_a_max)
@@ -811,15 +817,24 @@ class SettingsPanel(QFrame):
         setattr(config, f"{kind}_wf_b", getattr(self, f"{prefix}_wf_b").currentText())
 
     def _on_save(self) -> None:
-        """保存所有既有设置字段。"""
+        """处理用户点击“保存设置”。"""
+        self.save_settings()
+
+    def save_settings(self, show_feedback: bool = True,
+                      notify: bool = True,
+                      strict_connection: bool = True) -> bool:
+        """采集全部控件并保存，返回是否完成保存。"""
         protocol = self._connection_widget.get_protocol()
         relay_url = self._connection_widget.v4_relay_url.text().strip()
         if protocol == "v4":
             parsed_relay = urlsplit(relay_url)
             if parsed_relay.scheme not in {"ws", "wss"} or not parsed_relay.netloc:
-                self._show_feedback("Relay 地址无效")
-                self._connection_widget.v4_relay_url.setFocus()
-                return
+                if strict_connection:
+                    if show_feedback:
+                        self._show_feedback("Relay 地址无效")
+                    self._connection_widget.v4_relay_url.setFocus()
+                    return False
+                relay_url = self._config_mgr.config.app.v4_relay_url
 
         cfg = self._config_mgr.config
         ac = cfg.aircraft
@@ -843,6 +858,7 @@ class SettingsPanel(QFrame):
         tank.random_interval = self.tank_wf_interval.value()
 
         cas = cfg.cas
+        cas.enabled = self.cas_enabled.isChecked()
         cas.gforce_min = self.cas_gforce_min.value()
         cas.gforce_max = self.cas_gforce_max.value()
         cas.channel_a_max = self.cas_ch_a.value()
@@ -875,9 +891,11 @@ class SettingsPanel(QFrame):
         if self._overlay_size_var:
             cfg.app.overlay_size = self._overlay_size_var.get()
         self._config_mgr.save()
-        self._show_feedback("已保存")
-        if self._on_save_callback:
+        if show_feedback:
+            self._show_feedback("已保存")
+        if notify and self._on_save_callback:
             self._on_save_callback()
+        return True
 
     def _on_reset(self) -> None:
         """恢复默认配置并刷新控件。"""
@@ -1058,11 +1076,12 @@ class MainWindow(QMainWindow):
         _set_windows_app_id()
         existing = QApplication.instance()
         self._app = existing or QApplication(sys.argv)
+        self._app.setQuitOnLastWindowClosed(False)
         setup_styles(self._app)
         super().__init__()
         self.root = self
         self.setObjectName("appWindow")
-        self.setWindowTitle("郊狼雷霆 v1 beta")
+        self.setWindowTitle("郊狼雷霆 v1 beta_1")
         app_icon = QIcon(_resource_path("tubiao.ico"))
         if not app_icon.isNull():
             self.setWindowIcon(app_icon)
@@ -1073,7 +1092,10 @@ class MainWindow(QMainWindow):
         self._on_mode_changed = on_mode_changed
         self._close_callback: Callable | None = None
         self._startup_topmost = False
+        self._exit_requested = False
+        self._tray_notice_shown = False
         self._build()
+        self._build_tray(app_icon)
 
     def _build(self) -> None:
         """组装主界面的三栏布局。"""
@@ -1115,6 +1137,66 @@ class MainWindow(QMainWindow):
         splitter.setSizes([295, 620, 285])
         layout.addWidget(splitter, 1)
 
+    def _build_tray(self, icon: QIcon) -> None:
+        """创建系统托盘图标、菜单和恢复交互。"""
+        self.tray_icon = QSystemTrayIcon(icon, self)
+        self.tray_icon.setObjectName("systemTrayIcon")
+        self.tray_icon.setToolTip("郊狼雷霆")
+
+        self.tray_menu = QMenu()
+        self.tray_menu.setObjectName("trayMenu")
+        self.show_window_action = QAction("显示主窗口", self)
+        self.show_window_action.setObjectName("showWindowAction")
+        self.exit_program_action = QAction("退出程序", self)
+        self.exit_program_action.setObjectName("exitProgramAction")
+        self.show_window_action.triggered.connect(self.restore_from_tray)
+        self.exit_program_action.triggered.connect(self._request_exit)
+        self.tray_menu.addAction(self.show_window_action)
+        self.tray_menu.addSeparator()
+        self.tray_menu.addAction(self.exit_program_action)
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+
+        self._tray_available = QSystemTrayIcon.isSystemTrayAvailable()
+        if self._tray_available:
+            self.tray_icon.show()
+
+    def _on_tray_activated(
+            self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        """双击托盘图标时恢复主窗口。"""
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self.restore_from_tray()
+
+    def restore_from_tray(self) -> None:
+        """从系统托盘恢复、提升并激活主窗口。"""
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        handle = self.windowHandle()
+        if handle is not None:
+            handle.requestActivate()
+
+    def save_current_settings(self) -> bool:
+        """静默保存界面当前设置，自动保存时保留无效 Relay 旧值。"""
+        return self.settings_panel.save_settings(
+            show_feedback=False,
+            notify=False,
+            strict_connection=False,
+        )
+
+    def _request_exit(self) -> None:
+        """响应托盘退出命令并交给主控制器清理资源。"""
+        if self._exit_requested:
+            return
+        self._exit_requested = True
+        self.save_current_settings()
+        self.tray_icon.hide()
+        if self._close_callback:
+            callback = self._close_callback
+            QTimer.singleShot(0, callback)
+        else:
+            self.quit()
+
     def _on_settings_saved(self) -> None:
         """设置保存后通知业务控制器。"""
         if self._on_mode_changed:
@@ -1144,7 +1226,7 @@ class MainWindow(QMainWindow):
         return True
 
     def set_close_callback(self, callback: Callable) -> None:
-        """设置用户关闭主窗口时的清理回调。"""
+        """设置托盘“退出程序”时的资源清理回调。"""
         self._close_callback = callback
 
     def get_mode(self) -> str:
@@ -1213,15 +1295,30 @@ class MainWindow(QMainWindow):
 
     def quit(self) -> None:
         """关闭窗口和 Qt 事件循环。"""
+        self._exit_requested = True
         self._close_callback = None
+        self.tray_icon.hide()
         self.hide()
         self._app.quit()
 
     def closeEvent(self, event) -> None:
-        """将窗口关闭操作交给主控制器清理资源。"""
-        if self._close_callback:
-            callback = self._close_callback
-            event.ignore()
-            QTimer.singleShot(0, callback)
+        """关闭按钮隐藏到托盘，托盘不可用时才真正退出。"""
+        if self._exit_requested:
+            event.accept()
             return
-        event.accept()
+        if not self._tray_available:
+            event.ignore()
+            self._request_exit()
+            return
+
+        self.save_current_settings()
+        event.ignore()
+        self.hide()
+        if not self._tray_notice_shown:
+            self._tray_notice_shown = True
+            self.tray_icon.showMessage(
+                "郊狼雷霆仍在运行",
+                "双击托盘图标可恢复窗口，右键选择“退出程序”才会完全退出。",
+                QSystemTrayIcon.MessageIcon.Information,
+                4000,
+            )

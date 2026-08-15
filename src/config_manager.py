@@ -35,6 +35,7 @@ class TankSettings:
 @dataclass
 class CasSettings:
     """CAS（陆战空中支援）设置 — 陆战中上飞机时使用"""
+    enabled: bool = True
     gforce_min: float = 1.0
     gforce_max: float = 10.0
     channel_a_max: int = 0
@@ -118,13 +119,20 @@ class ConfigManager:
 
     @property
     def config(self) -> Config:
+        """返回当前内存中的完整配置。"""
         return self._config
+
+    @property
+    def config_path(self) -> str:
+        """返回配置文件的绝对路径。"""
+        return os.path.abspath(self._config_path)
 
     def load(self) -> Config:
         """从文件加载配置，文件不存在时使用默认值"""
-        if os.path.exists(self._config_path):
+        config_path = self.config_path
+        if os.path.exists(config_path):
             try:
-                with open(self._config_path, "r", encoding="utf-8") as f:
+                with open(config_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 self._apply_dict(data)
             except (json.JSONDecodeError, KeyError, TypeError):
@@ -133,9 +141,25 @@ class ConfigManager:
         return self._config
 
     def save(self) -> None:
-        """保存当前配置到文件"""
-        with open(self._config_path, "w", encoding="utf-8") as f:
-            json.dump(self._to_dict(), f, indent=2, ensure_ascii=False)
+        """使用原子替换将当前配置保存到文件。"""
+        config_path = self.config_path
+        config_dir = os.path.dirname(config_path)
+        os.makedirs(config_dir, exist_ok=True)
+        temp_path = f"{config_path}.tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as file:
+                json.dump(
+                    self._to_dict(),
+                    file,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temp_path, config_path)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
     def reset_defaults(self) -> Config:
         """恢复所有默认值"""
@@ -203,6 +227,7 @@ class ConfigManager:
         if "cas" in data:
             cs = data["cas"]
             self._config.cas = CasSettings(
+                enabled=bool(cs.get("enabled", True)),
                 gforce_min=float(cs.get("gforce_min", 1.0)),
                 gforce_max=float(cs.get("gforce_max", 10.0)),
                 channel_a_max=int(cs.get("channel_a_max", 0)),

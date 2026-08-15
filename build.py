@@ -5,7 +5,7 @@
     python build.py
 
 产物:
-    dist/WT-DGLAB.exe — 可独立运行的 Windows 程序
+    WT-DGLAB v1 beta_1.exe — 可独立运行的 Windows 程序
 """
 
 import os
@@ -24,7 +24,7 @@ def build():
         sys.executable, "-m", "PyInstaller",
         "--onefile",              # 单个 exe 文件
         "--windowed",            # 不显示控制台窗口
-        "--name", "WT-DGLAB",
+        "--name", "WT-DGLAB v1 beta_1",
         "--distpath", ".",       # 直接输出到项目根目录
         "--add-data", f"src{os.pathsep}src",
         "--add-data", f"注意事项.txt{os.pathsep}.",
@@ -53,7 +53,7 @@ def build():
 
     result = subprocess.run(cmd, cwd=project_root)
     if result.returncode == 0:
-        exe_path = os.path.join(project_root, "WT-DGLAB.exe")
+        exe_path = os.path.join(project_root, "WT-DGLAB v1 beta_1.exe")
         print()
         print("=" * 60)
         print(f"  [OK] 打包成功!")

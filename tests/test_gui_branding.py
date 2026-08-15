@@ -11,7 +11,7 @@ from src.gui.main_window import MainWindow, _resource_path
 
 
 def test_windows_icon_contains_multiple_standard_sizes():
-    """构建图标包含任务栏和任务管理器常用的多档尺寸。"""
+    """tubiao1 转换后的图标包含 Windows 常用的多档尺寸。"""
     project_root = os.path.dirname(os.path.dirname(__file__))
     icon_path = os.path.join(project_root, "tubiao.ico")
     expected_sizes = {
@@ -26,13 +26,16 @@ def test_windows_icon_contains_multiple_standard_sizes():
     with Image.open(os.path.join(project_root, "tubiao_ui.jpg")) as brand:
         assert brand.size == (256, 256)
 
+    with Image.open(os.path.join(project_root, "tubiao1.jpg")) as source:
+        assert source.size == (2048, 2048)
 
-def test_tubiao_is_used_for_window_and_brand_icons(tmp_path):
-    """窗口和左上角标记均成功加载 tubiao.jpg。"""
+
+def test_tubiao1_outputs_are_used_for_window_and_brand_icons(tmp_path):
+    """窗口和左上角标记均成功加载 tubiao1 的转换产物。"""
     manager = ConfigManager(str(tmp_path / "config.json"))
     window = MainWindow(manager)
 
-    assert window.windowTitle() == "郊狼雷霆 v1 beta"
+    assert window.windowTitle() == "郊狼雷霆 v1 beta_1"
     assert os.path.basename(_resource_path("tubiao_ui.jpg")) == "tubiao_ui.jpg"
     assert os.path.basename(_resource_path("tubiao.ico")) == "tubiao.ico"
     assert not window.windowIcon().isNull()
@@ -59,4 +62,20 @@ def test_refresh_interval_lives_on_dashboard_and_still_saves(tmp_path):
 
     assert manager.config.app.refresh_interval_ms == 420
     assert ConfigManager(str(config_path)).load().app.refresh_interval_ms == 420
+    window.close()
+
+
+def test_cas_enabled_setting_loads_and_saves(tmp_path):
+    """CAS 总开关在界面和配置之间正确同步。"""
+    config_path = tmp_path / "config.json"
+    manager = ConfigManager(str(config_path))
+    manager.config.cas.enabled = False
+    window = MainWindow(manager)
+
+    assert window.settings_panel.cas_enabled.isChecked() is False
+    window.settings_panel.cas_enabled.setChecked(True)
+    window.settings_panel.save_button.click()
+
+    assert manager.config.cas.enabled is True
+    assert ConfigManager(str(config_path)).load().cas.enabled is True
     window.close()

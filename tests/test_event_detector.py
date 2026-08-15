@@ -211,6 +211,24 @@ def test_repair_only_triggers_on_rising_edge():
     assert second["kind"] == "repair"
 
 
+def test_kill_takes_priority_when_repair_starts_in_same_poll():
+    """同轮开始维修并击杀时先返回击杀，维修边沿保持已消费状态。"""
+    reader = QueuedReader([
+        (True, []),
+        (True, [{"id": 1, "msg": "玩家击毁了敌人"}]),
+        (True, []),
+    ])
+    detector = EventDetector(reader)
+    aircraft, tank = make_configs()
+
+    detector.poll(active_state(repairing=False), "tank", aircraft, tank)
+    kill = detector.poll(active_state(repairing=True), "tank", aircraft, tank)
+    held = detector.poll(active_state(repairing=True), "tank", aircraft, tank)
+
+    assert kill["kind"] == "kill"
+    assert held == {}
+
+
 def test_actual_vehicle_type_selects_event_configuration():
     """实际载具类型优先于 UI 模式选择事件配置。"""
     reader = QueuedReader([
@@ -226,3 +244,39 @@ def test_actual_vehicle_type_selects_event_configuration():
     assert event["mode"] == "tank"
     assert event["ch_a"] == 21
     assert event["wf_a"] == "陆战击杀A"
+
+
+def test_land_cas_uses_tank_event_configuration():
+    """陆战模式上飞机时，CAS 事件使用陆战击杀/死亡参数。"""
+    reader = QueuedReader([
+        (True, []),
+        (True, [{"id": 1, "msg": "玩家击落了敌机"}]),
+    ])
+    detector = EventDetector(reader)
+    aircraft, tank = make_configs()
+
+    detector.poll(GameState(), "tank", aircraft, tank)
+    event = detector.poll(active_state("aircraft"), "tank", aircraft, tank,
+                          cas_enabled=True)
+
+    assert event["kind"] == "kill"
+    assert event["mode"] == "aircraft"
+    assert event["ch_a"] == 21
+    assert event["ch_b"] == 22
+
+
+def test_land_cas_disabled_consumes_records_without_event():
+    """关闭 CAS 触发后仍推进 HUD 游标，但不输出飞机事件。"""
+    reader = QueuedReader([
+        (True, []),
+        (True, [{"id": 1, "msg": "玩家击落了敌机"}]),
+    ])
+    detector = EventDetector(reader)
+    aircraft, tank = make_configs()
+
+    detector.poll(GameState(), "tank", aircraft, tank)
+    event = detector.poll(active_state("aircraft"), "tank", aircraft, tank,
+                          cas_enabled=False)
+
+    assert event == {}
+    assert detector.last_dmg_id == 1

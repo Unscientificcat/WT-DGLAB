@@ -34,7 +34,7 @@ class EventDetector:
         return self._cursor_ready
 
     def poll(self, state: GameState, current_mode: str,
-             aircraft_events, tank_events) -> dict:
+             aircraft_events, tank_events, cas_enabled: bool = True) -> dict:
         """读取一次 HUD 增量并检测事件。
 
         首次成功读取只建立历史基线；游戏数据无效时继续推进游标但不返回
@@ -60,15 +60,29 @@ class EventDetector:
             logger.info(f"HUD 事件游标已定位到 ID {self._last_dmg_id}")
             return {}
 
-        mode = state.vehicle_type or current_mode
-        if mode == "aircraft":
-            event_config = aircraft_events
+        actual_type = state.vehicle_type
+        is_cas = current_mode == "tank" and actual_type == "aircraft"
+        if is_cas:
+            # 陆战模式上飞机仍使用陆战事件参数，但事件显示保留飞机语义。
             self._repair_active = False
-        elif mode == "tank":
+            if not cas_enabled:
+                return {}
+            mode = "aircraft"
+            event_config = tank_events
+        elif actual_type == "aircraft" or (
+                not actual_type and current_mode == "aircraft"):
+            mode = "aircraft"
+            event_config = aircraft_events
+        elif actual_type == "tank" or (
+                not actual_type and current_mode == "tank"):
+            mode = "tank"
             event_config = tank_events
         else:
             self._repair_active = False
             return {}
+
+        if mode == "aircraft":
+            self._repair_active = False
 
         repair_event = self._detect_repair(state, mode, event_config)
         hud_event = self._detect_hud_event(new_records, mode, event_config)

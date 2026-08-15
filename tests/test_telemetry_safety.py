@@ -5,7 +5,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from main import App
-from src.game_reader import GameReader, GameState
+from src.config_manager import CasSettings, TankEventSettings
+from src.game_reader import AircraftData, GameReader, GameState, TankData
 
 
 class FakeResponse:
@@ -179,6 +180,7 @@ def test_app_queues_events_returned_by_event_detector():
     app.config_mgr = SimpleNamespace(config=SimpleNamespace(
         events=aircraft_events,
         tank_events=tank_events,
+        cas=SimpleNamespace(enabled=True),
     ))
     app._current_mode = "tank"
     app._event_queue = queue.Queue()
@@ -195,8 +197,121 @@ def test_app_queues_events_returned_by_event_detector():
         "tank",
         aircraft_events,
         tank_events,
+        True,
     )
     assert app._event_queue.get_nowait() == {
         "kind": "kill",
         "mode": "tank",
     }
+
+
+def test_finished_kill_resumes_repair_when_tank_is_still_repairing():
+    """击杀覆盖结束后，持续中的维修应立即恢复维修事件。"""
+    repair_config = TankEventSettings(
+        repair_enabled=True,
+        repair_ch_a=81,
+        repair_ch_b=42,
+        repair_wf_a="维修A",
+        repair_wf_b="维修B",
+    )
+    app = App.__new__(App)
+    app.config_mgr = SimpleNamespace(config=SimpleNamespace(
+        tank_events=repair_config,
+    ))
+    app._last_state = GameState(
+        connected=True,
+        vehicle_type="tank",
+        tank=TankData(valid=True, is_repairing=True),
+    )
+    app._event_kind = "kill"
+    app._event_mode = "tank"
+    app._event_ch_a = 100
+    app._event_ch_b = 60
+    app._event_remaining = 0.0
+    app._apply_waveform = Mock()
+    app.coyote = SimpleNamespace(
+        set_waveform_a=Mock(),
+        set_waveform_b=Mock(),
+    )
+    app.window = SimpleNamespace(
+        dashboard=SimpleNamespace(show_event=Mock()),
+    )
+
+    app._finish_active_event()
+
+    assert app._event_kind == "repair"
+    assert app._event_mode == "tank"
+    assert app._event_ch_a == 81
+    assert app._event_ch_b == 42
+    assert app._event_remaining == 60.0
+    app.coyote.set_waveform_a.assert_called_once_with("维修A")
+    app.coyote.set_waveform_b.assert_called_once_with("维修B")
+    app.window.dashboard.show_event.assert_called_once_with("🔧 维修中")
+    app._apply_waveform.assert_not_called()
+
+
+def test_finished_kill_returns_to_normal_when_repair_has_stopped():
+    """击杀结束时已停止维修，应恢复常规映射而非维修输出。"""
+    app = App.__new__(App)
+    app.config_mgr = SimpleNamespace(config=SimpleNamespace(
+        tank_events=TankEventSettings(repair_enabled=True),
+    ))
+    app._last_state = GameState(
+        connected=True,
+        vehicle_type="tank",
+        tank=TankData(valid=True, is_repairing=False),
+    )
+    app._event_kind = "kill"
+    app._event_mode = "tank"
+    app._event_ch_a = 100
+    app._event_ch_b = 60
+    app._event_remaining = 0.0
+    app._apply_waveform = Mock()
+    app.window = SimpleNamespace(
+        dashboard=SimpleNamespace(show_event=Mock()),
+    )
+
+    app._finish_active_event()
+
+    assert app._event_kind == ""
+    assert app._event_remaining == 0.0
+    app.window.dashboard.show_event.assert_called_once_with("")
+    app._apply_waveform.assert_called_once()
+
+
+def test_disabled_cas_zeroes_aircraft_output_in_land_mode():
+    """陆战模式关闭 CAS 后，上飞机不再输出过载强度。"""
+    from src.config_manager import AircraftSettings, TankSettings
+
+    app = App.__new__(App)
+    app.config_mgr = SimpleNamespace(config=SimpleNamespace(
+        aircraft=AircraftSettings(channel_a_max=100, channel_b_max=100),
+        tank=TankSettings(channel_a_max=100, channel_b_max=100),
+        cas=CasSettings(enabled=False, channel_a_max=100, channel_b_max=100),
+        events=SimpleNamespace(),
+        tank_events=TankEventSettings(),
+    ))
+    app._last_state = GameState()
+    app._wt_fail_count = 0
+    app._wt_connected = False
+    app._event_kind = ""
+    app._event_mode = ""
+    app._event_remaining = 0.0
+    app._overlay_tick = 0
+    app._overlay_last_value = ""
+    app._overlay_last_unit = ""
+    app.coyote = SimpleNamespace(status=SimpleNamespace(bound=False))
+    app._sync_overlay = Mock()
+    app.window = SimpleNamespace(
+        get_mode=Mock(return_value="tank"),
+        status_bar=SimpleNamespace(set_wt_status=Mock()),
+        dashboard=SimpleNamespace(update_aircraft=Mock()),
+    )
+
+    app._apply_game_state(GameState(
+        connected=True,
+        vehicle_type="aircraft",
+        aircraft=AircraftData(valid=True, gforce=8.0),
+    ))
+
+    app.window.dashboard.update_aircraft.assert_called_once_with(8.0, 0, 0)
