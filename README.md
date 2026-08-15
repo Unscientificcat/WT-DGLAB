@@ -342,6 +342,6 @@ python build.py
 
 ## 许可证与声明
 
-本仓库当前未附带 `LICENSE` 文件，因此不要将其视为已经采用 MIT 或其他开源许可证。准备正式开源时，请由仓库所有者补充合适的许可证。
+本项目采用 [MIT License](LICENSE) 开源。除非另有说明，项目代码均按 MIT License 授权；使用、修改和再发布时请保留许可证及版权声明。
 
 本项目是非官方第三方工具，与 Gaijin Entertainment、War Thunder、DG-LAB 或地牢实验室不存在隶属或授权关系。相关名称和商标归各自权利人所有。
