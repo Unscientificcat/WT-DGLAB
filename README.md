@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-v1%20beta_1-4f8fe8" alt="版本 v1 beta_1">
+<img src="https://img.shields.io/badge/version-v1%20beta_2-4f8fe8" alt="版本 v1 beta_2">
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-2d7dd2" alt="Windows 10 / 11">
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776ab" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/DG--LAB%20App-V3%20%2F%20V4-ef6f91" alt="DG-LAB App V3 / V4">
@@ -26,7 +26,7 @@
 
 本项目是一个 Vibe Coding 实践作品，代码、协议判断和安全行为仍应以实际测试结果为准。
 
-当前版本为 `v1 beta_1`。协议、界面和自动化回归已经验证；DG-LAB 4.x App 与实际郊狼设备的完整实机联调仍在进行中，请谨慎测试。
+当前版本为 `v1 beta_2`。协议、界面和自动化回归已经验证；DG-LAB 4.x App 与实际郊狼设备的完整实机联调仍在进行中，请谨慎测试。
 
 ## 功能
 
@@ -54,6 +54,7 @@
 - 浅色 PySide6 三栏界面，默认面向 1080p，支持拖动分栏。
 - 透明置顶悬浮窗，提供大 / 中 / 小三档尺寸；大档兼顾 2K 屏幕。
 - 参数保存、恢复默认和启动自动加载。
+- HUD 击杀、被击杀和坠毁事件自动适配英语、俄语、法语、德语、简体中文、繁体中文和日文。
 - 点击右上角关闭按钮后缩小到系统托盘，后台联动继续运行；托盘右键选择“退出程序”才会真正退出。
 - 重复启动 EXE 时不会创建第二套程序实例，而是恢复并激活已运行的主窗口。
 - 关闭到托盘和托盘退出时自动保存当前界面设置，配置文件保存在 EXE 同目录，首次启动会自动生成。
@@ -77,9 +78,9 @@
 
 ### 使用发布版 EXE
 
-1. 从 GitHub Releases 下载 `WT-DGLAB v1 beta_1.exe`。
+1. 从 GitHub Releases 下载 `WT-DGLAB v1 beta_2.exe`。
 2. 启动《战争雷霆》，进入机库或对局。
-3. 运行 `WT-DGLAB v1 beta_1.exe`，阅读并确认注意事项。
+3. 运行 `WT-DGLAB v1 beta_2.exe`，阅读并确认注意事项。
 4. 在右侧“连接郊狼”区域选择 `V3 App` 或 `V4 App`。
 5. 使用手机 App 扫描程序显示的二维码。
 6. 先将 A/B 最大强度设为 `0`，确认连接、模式和波形正确后再逐步增加。
@@ -92,7 +93,7 @@
 
 1. 在程序右侧选择 `V3 App`，默认本机服务端端口为 `8765`。
 2. 确保手机和电脑连接同一局域网，且未开启 AP 隔离或访客网络隔离。
-3. 首次运行时，允许 `WT-DGLAB v1 beta_1.exe` 通过 Windows 防火墙的“专用网络”。
+3. 首次运行时，允许 `WT-DGLAB v1 beta_2.exe` 通过 Windows 防火墙的“专用网络”。
 4. 在 DG-LAB 3.x App 的 Socket / 扫码控制入口扫描二维码。
 
 V3 只需要局域网入站连接，不需要在路由器上配置公网端口映射，也不建议将 `8765` 暴露到公网。若修改了程序中的 V3 端口，防火墙规则也要允许相应 TCP 端口。
@@ -116,7 +117,7 @@ V4 由程序主动连接 Relay，通常不需要开放电脑的 `8765` 入站端
 | A/B 通道 | 最大强度 | 独立限制两个通道，范围 `0..200` |
 | 波形 | 恒定 / 预设 / 随机 | 设置常规映射和事件输出的波形 |
 | 事件 | 强度 / 持续时间 | 设置击杀、被击落、被摧毁和维修反馈 |
-| 玩家昵称 | 游戏内昵称 | 用于区分与玩家相关的 HUD 事件，请保持完全一致 |
+| 玩家昵称 | 游戏内昵称 | 用于区分与玩家相关的 HUD 事件，请保持完全一致；支持的游戏语言会自动识别 |
 | 刷新间隔 | `50..1000 ms` | 控制读取 8111 数据的频率，默认 `200 ms` |
 | 悬浮窗 | 开关与尺寸 | 显示当前遥测、事件和 A/B 输出 |
 
@@ -149,7 +150,7 @@ value >= max  -> channel_max
 ### V3 扫码后无法连接
 
 - 确认手机和电脑在同一网段，而不是访客 Wi-Fi。
-- 允许 `WT-DGLAB v1 beta_1.exe` 通过 Windows 专用网络防火墙。
+- 允许 `WT-DGLAB v1 beta_2.exe` 通过 Windows 专用网络防火墙。
 - 确认程序显示的 IP 是手机能够访问的局域网地址。
 - 检查 V3 端口是否被其他程序占用。
 - 不要为此配置公网端口转发。
@@ -200,7 +201,7 @@ python -m pytest -q
 python build.py
 ```
 
-打包脚本使用 PyInstaller `--onefile --windowed`，产物为项目根目录下的 `WT-DGLAB v1 beta_1.exe`。Windows 程序图标使用预制的多尺寸 `tubiao.ico`。
+打包脚本使用 PyInstaller `--onefile --windowed`，产物为项目根目录下的 `WT-DGLAB v1 beta_2.exe`。Windows 程序图标使用预制的多尺寸 `tubiao.ico`。
 
 ## 架构
 
@@ -245,6 +246,13 @@ python build.py
 
 ## 更新日志
 
+### v1 beta_2
+
+- HUD 击杀、被击杀和坠毁事件新增英语、俄语、法语、德语、简体中文、繁体中文和日文自动识别。
+- 区分主动与被动事件格式，并增加 Unicode、零宽字符、空白和大小写标准化。
+- 七种语言的击杀、死亡和坠毁回归测试已通过，完整自动测试为 `98 passed`。
+- 窗口标题、Windows 应用标识和发布产物统一更新为 `WT-DGLAB v1 beta_2`。
+
 ### v1 beta_1
 
 本次版本整理了 2026-08-15 晚间完成的稳定性和陆战 CAS 更新，内容包括：
@@ -256,7 +264,7 @@ python build.py
 - 增加陆战“启用 CAS 触发”开关，可独立控制上飞机后的过载、击杀和坠毁输出。
 - 修复陆战 CAS 使用错误事件配置导致击杀和坠毁事件不触发的问题。
 - 完成图标、窗口标题、任务栏和任务管理器品牌标识统一，版本标识为 `郊狼雷霆 v1 beta_1`。
-- 完成根目录与发布目录回归测试，共 `51` 项通过，并重新生成 `WT-DGLAB v1 beta_1.exe`。
+- 完成根目录与发布目录回归测试，当时共 `51` 项通过，并生成 `WT-DGLAB v1 beta_1.exe`。
 
 ### v1 beta
 
@@ -331,7 +339,7 @@ python build.py
 
 - `config.json` 可能包含玩家昵称和个人强度设置，公开仓库前应确认其中没有隐私信息。
 - `wt-dglab-trace.log` 属于诊断日志，不应作为正式发布内容。
-- 建议通过 GitHub Releases 分发 `WT-DGLAB v1 beta_1.exe`，不要要求普通用户从源码构建。
+- 建议通过 GitHub Releases 分发 `WT-DGLAB v1 beta_2.exe`，不要要求普通用户从源码构建。
 
 ## 相关资料
 
