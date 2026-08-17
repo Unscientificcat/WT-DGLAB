@@ -4,6 +4,8 @@
 """
 
 import logging
+import re
+import unicodedata
 
 from .game_reader import GameReader, GameState
 
@@ -11,7 +13,56 @@ from .game_reader import GameReader, GameState
 logger = logging.getLogger("EventDetector")
 
 ZERO_WIDTH_CHARS = frozenset("​‌‍‎‏⁠﻿")
-DESTROY_KEYWORDS = ("击落了", "击毁了")
+WHITESPACE_RE = re.compile(r"\s+")
+
+# 被动格式必须优先匹配，避免 "shot down by" 被 "shot down" 抢先识别。
+PASSIVE_DESTROY_KEYWORDS = (
+    "has been destroyed by",
+    "wurde abgeschossen von",
+    "wurde zerstört von",
+    "shot down by",
+    "destroyed by",
+    "a été détruit par",
+    "abattu par",
+    "détruit par",
+    "сбит игроком",
+    "уничтожен игроком",
+    "уничтожен",
+    "已被击落,攻击者为",
+    "已被击毁,攻击者为",
+    "已被摧毁,攻击者为",
+    "已被擊落,攻擊者是",
+    "已被摧毀,攻擊者為",
+)
+
+ACTIVE_DESTROY_KEYWORDS = (
+    "shot down",
+    "destroyed",
+    "abattu",
+    "détruit",
+    "abgeschossen",
+    "zerstört",
+    "сбил",
+    "уничтожил",
+    "击落了",
+    "击毁了",
+    "擊落了",
+    "擊毀了",
+    "撃墜されました",
+    "によって 撃破されました",
+    "によって撃破されました",
+)
+
+CRASH_KEYWORDS = (
+    "has crashed.",
+    "s'est écrasé.",
+    "ist abgestürzt.",
+    "разбился",
+    "已坠毁",
+    "已墜毀",
+    "は 墜落しました",
+    "は墜落しました",
+)
 
 
 class EventDetector:
@@ -137,25 +188,43 @@ class EventDetector:
             if player_name not in message:
                 continue
 
-            is_kill = any(
-                keyword in message
-                and player_name in message.split(keyword, 1)[0]
-                for keyword in DESTROY_KEYWORDS
-            )
-            is_death = any(
-                keyword in message
-                and player_name in message.split(keyword, 1)[1]
-                for keyword in DESTROY_KEYWORDS
-            )
-            if not is_death and "已坠毁" in message:
-                is_death = True
-
-            if is_kill and getattr(event_config, "kill_enabled", False):
+            kind = self._classify_hud_message(message, player_name)
+            if kind == "kill" and getattr(
+                    event_config, "kill_enabled", False):
                 result = self._build_event("kill", mode, event_config)
-            elif is_death and getattr(event_config, "death_enabled", False):
+            elif kind == "death" and getattr(
+                    event_config, "death_enabled", False):
                 result = self._build_event("death", mode, event_config)
 
         return result
+
+    @staticmethod
+    def _classify_hud_message(message: str, player_name: str) -> str:
+        """按官方本地化词条判断玩家是击杀方还是被击杀方。"""
+        for keyword in PASSIVE_DESTROY_KEYWORDS:
+            before, separator, after = message.partition(keyword)
+            if not separator:
+                continue
+            if player_name in before:
+                return "death"
+            if player_name in after:
+                return "kill"
+
+        for keyword in ACTIVE_DESTROY_KEYWORDS:
+            before, separator, after = message.partition(keyword)
+            if not separator:
+                continue
+            if player_name in before:
+                return "kill"
+            if player_name in after:
+                return "death"
+
+        for keyword in CRASH_KEYWORDS:
+            before, separator, _after = message.partition(keyword)
+            if separator and player_name in before:
+                return "death"
+
+        return ""
 
     @staticmethod
     def _build_event(kind: str, mode: str, event_config) -> dict:
@@ -181,5 +250,9 @@ class EventDetector:
 
     @staticmethod
     def _normalize(text: str) -> str:
-        """移除战争雷霆 HUD 文本中的 Unicode 零宽字符。"""
-        return "".join(char for char in text if char not in ZERO_WIDTH_CHARS)
+        """统一 HUD 文本的 Unicode、零宽字符、空白和大小写。"""
+        normalized = unicodedata.normalize("NFKC", text)
+        normalized = "".join(
+            char for char in normalized if char not in ZERO_WIDTH_CHARS
+        )
+        return WHITESPACE_RE.sub(" ", normalized).strip().casefold()

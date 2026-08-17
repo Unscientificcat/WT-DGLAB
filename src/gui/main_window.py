@@ -57,7 +57,7 @@ def _set_windows_app_id() -> None:
         return
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "WT-DGLAB.v1-beta_1.tubiao1"
+            "WT-DGLAB.v1-beta_2.tubiao1"
         )
     except (AttributeError, OSError):
         pass
@@ -1081,7 +1081,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.root = self
         self.setObjectName("appWindow")
-        self.setWindowTitle("郊狼雷霆 v1 beta_1")
+        self.setWindowTitle("郊狼雷霆 v1 beta_2")
         app_icon = QIcon(_resource_path("tubiao.ico"))
         if not app_icon.isNull():
             self.setWindowIcon(app_icon)
