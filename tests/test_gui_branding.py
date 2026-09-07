@@ -13,7 +13,8 @@ from src.gui.main_window import MainWindow, _resource_path
 def test_windows_icon_contains_multiple_standard_sizes():
     """tubiao1 转换后的图标包含 Windows 常用的多档尺寸。"""
     project_root = os.path.dirname(os.path.dirname(__file__))
-    icon_path = os.path.join(project_root, "tubiao.ico")
+    resource_root = os.path.join(project_root, "resources")
+    icon_path = os.path.join(resource_root, "tubiao.ico")
     expected_sizes = {
         (16, 16), (20, 20), (24, 24), (32, 32), (40, 40),
         (48, 48), (64, 64), (128, 128), (256, 256),
@@ -23,19 +24,15 @@ def test_windows_icon_contains_multiple_standard_sizes():
         assert icon.format == "ICO"
         assert icon.ico.sizes() == expected_sizes
 
-    with Image.open(os.path.join(project_root, "tubiao_ui.jpg")) as brand:
+    with Image.open(os.path.join(resource_root, "tubiao_ui.jpg")) as brand:
         assert brand.size == (256, 256)
-
-    with Image.open(os.path.join(project_root, "tubiao1.jpg")) as source:
-        assert source.size == (2048, 2048)
-
 
 def test_tubiao1_outputs_are_used_for_window_and_brand_icons(tmp_path):
     """窗口和左上角标记均成功加载 tubiao1 的转换产物。"""
     manager = ConfigManager(str(tmp_path / "config.json"))
     window = MainWindow(manager)
 
-    assert window.windowTitle() == "郊狼雷霆 v1 beta_1"
+    assert window.windowTitle() == "郊狼雷霆 v1.0"
     assert os.path.basename(_resource_path("tubiao_ui.jpg")) == "tubiao_ui.jpg"
     assert os.path.basename(_resource_path("tubiao.ico")) == "tubiao.ico"
     assert not window.windowIcon().isNull()

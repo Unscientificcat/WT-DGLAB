@@ -38,7 +38,7 @@
 
 - `status_bar.set_wt_status()` 与 `status_bar.set_coyote_status()`
 - `dashboard.update_aircraft()`、`update_tank()`、`show_event()` 与 `clear()`
-- `settings_panel.get_mode()`
+- `dashboard.get_mode()` 与 `MainWindow.get_mode()`
 - `qr_widget.set_status()`
 - `MainWindow.after()`、`run()`、`quit()`、`get_mode()`、`get_config()`
 

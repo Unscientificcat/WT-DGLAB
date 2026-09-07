@@ -1,4 +1,4 @@
-"""郊狼雷霆 v1 beta_1 — 战争雷霆 × 郊狼 3.0 电击联动
+"""郊狼雷霆 v1.0 — 战争雷霆 × 郊狼 3.0 电击联动
 
 启动方式：
     python main.py
@@ -15,6 +15,7 @@ import io
 import logging
 import threading
 import queue
+import random
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -27,10 +28,13 @@ from src.event_detector import EventDetector
 from src.game_reader import GameReader, GameState
 from src.coyote_controller import CoyoteController
 from src.coyote_v4_controller import CoyoteV4Controller
+from src.waveforms import WaveformCatalog
 from src.mapping_engine import MappingEngine
 from src.gui.disclaimer_dialog import show_disclaimer_dialog
-from src.gui.main_window import MainWindow
-from src.gui.overlay import OverlayWindow
+from src.gui.main_window import MainWindow, OverlayContentDialog
+from src.gui.overlay import OverlayWindow, OVERLAY_CONTENT_FLAGS
+from src.gui.waveform_scope import ChannelScopeDialog
+from src.runtime_paths import application_directory, resource_path
 from src.single_instance import SingleInstance
 
 logging.basicConfig(
@@ -43,9 +47,7 @@ logger = logging.getLogger("WT-DGLAB")
 
 def _application_directory() -> str:
     """返回源码项目目录或打包后 EXE 所在目录。"""
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.abspath(__file__))
+    return application_directory()
 
 
 def _config_file_path() -> str:
@@ -54,11 +56,17 @@ def _config_file_path() -> str:
 
 
 def _load_config_manager() -> ConfigManager:
-    """加载同目录配置，并在首次启动时创建默认配置文件。"""
+    """加载同目录配置，缺失时用安全模板生成配置文件。"""
     config_path = _config_file_path()
     config_exists = os.path.isfile(config_path)
     manager = ConfigManager(config_path)
-    manager.load()
+    if config_exists:
+        manager.load()
+    else:
+        manager.load_template(
+            os.path.join(_application_directory(), "config.default.json")
+        )
+        logger.info("未找到用户配置，将使用安全默认模板")
     if not config_exists:
         manager.save()
         logger.info(f"已生成默认配置: {config_path}")
@@ -71,6 +79,10 @@ class App:
     def __init__(self):
         # ===== 配置 =====
         self.config_mgr = _load_config_manager()
+        self.waveform_catalog = WaveformCatalog()
+        reload_result = self.waveform_catalog.reload()
+        if reload_result.errors:
+            logger.warning("波形文件跳过: %s", "; ".join(f"{n}: {e}" for n, e in reload_result.errors))
 
         # ===== 状态缓存（必须在 GUI 之前初始化，因为 GUI 初始化会触发回调）=====
         self._last_state = GameState()
@@ -86,12 +98,15 @@ class App:
         self._wt_fail_count = 0
         self._wt_connected = False
         self._overlay_tick = 0                      # 悬浮窗节流计数
-        self._overlay_last_value = ""               # 悬浮窗缓存：上次有效数值
-        self._overlay_last_unit = ""                # 悬浮窗缓存：上次有效单位
+        self._overlay_last_g = ""                   # 悬浮窗缓存：上次有效过载文本
+        self._overlay_last_speed = ""               # 悬浮窗缓存：上次有效速度文本
+        self._scope_dialogs: dict[str, ChannelScopeDialog] = {}  # 通道曲线窗口单例
+        self._overlay_content_dialog = None         # 悬浮窗显示内容设置单例
         self._window_ready = False
 
         # ===== GUI =====
         self.window = MainWindow(self.config_mgr,
+                                 waveform_catalog=self.waveform_catalog,
                                  on_mode_changed=self._on_mode_switched)
         self._window_ready = True
 
@@ -100,12 +115,22 @@ class App:
         self.window.dashboard.set_overlay_callback(
             self._apply_overlay_settings
         )
+        self.window.dashboard.set_overlay_content_callback(
+            self._open_overlay_content_dialog
+        )
+        self.window.dashboard.set_scope_callback(
+            self._open_channel_scope
+        )
+        self.overlay.value_font_changed.connect(
+            self._on_overlay_value_font_changed
+        )
+        self.overlay.content_settings_requested.connect(
+            self._open_overlay_content_dialog
+        )
+        self.overlay.set_content_flags(self._overlay_content_flags())
         if self._cfg.app.overlay_enabled:
             self.overlay.show()
-            self.overlay.set_size(self._cfg.app.overlay_size)
-            self.window.dashboard.overlay_var.set(True)
-            self.window.dashboard._overlay_size_var.set(
-                self._cfg.app.overlay_size)
+            self.overlay.set_value_font(self._cfg.app.overlay_size_px)
 
         # ===== 游戏数据读取器 =====
         self.game_reader = GameReader()
@@ -166,8 +191,9 @@ class App:
         self.window.save_current_settings()
         self.config_mgr.save()
         self._running = False
-        self.coyote.clear_all()
         self.coyote.stop()
+        for dialog in self._scope_dialogs.values():
+            dialog.close()
         self.overlay.destroy()
         self.window.quit()
 
@@ -297,6 +323,9 @@ class App:
             # 5. 更新郊狼状态
             self._process_coyote_start_result()
             self._update_coyote_status()
+
+            # 6. 同步当前输出波形名到仪表盘通道卡
+            self._update_channel_wave_names()
         except Exception as error:
             logger.error(f"UI 刷新异常: {error}", exc_info=True)
         finally:
@@ -310,8 +339,9 @@ class App:
         mode = self.window.get_mode()
         cfg = self._cfg
 
-        # 防抖：连续 3 次失败才认为断开
-        if state.connected:
+        # 状态灯反映"战争雷霆 8111 遥测服务是否可达"（主菜单同样为绿色）；
+        # 对局判定 connected 只驱动业务，不在此处使用。
+        if state.link_ok:
             self._wt_fail_count = 0
             if not self._wt_connected:
                 self._wt_connected = True
@@ -329,8 +359,8 @@ class App:
                 self._send_strength(0, 0)
             self._cancel_active_event()
             self.window.dashboard.clear(mode)
-            self._overlay_last_value = ""
-            self._overlay_last_unit = ""
+            self._overlay_last_g = ""
+            self._overlay_last_speed = ""
             self._sync_overlay(mode, 0, 0)
             return
 
@@ -374,8 +404,7 @@ class App:
                 ac = state.aircraft
                 cas_cfg = cfg.cas
                 if cas_cfg.enabled:
-                    self.coyote.set_waveform_a(cas_cfg.waveform_a, cas_cfg.random_interval)
-                    self.coyote.set_waveform_b(cas_cfg.waveform_b, cas_cfg.random_interval)
+                    self._set_normal_waveforms(cas_cfg)
                     intensity_a, intensity_b = MappingEngine.map_aircraft(
                         ac.gforce, cas_cfg.gforce_min, cas_cfg.gforce_max,
                         cas_cfg.channel_a_max, cas_cfg.channel_b_max)
@@ -385,8 +414,7 @@ class App:
                 # 在地面 → 速度触发
                 tk_data = state.tank
                 tk_cfg = cfg.tank
-                self.coyote.set_waveform_a(tk_cfg.waveform_a, tk_cfg.random_interval)
-                self.coyote.set_waveform_b(tk_cfg.waveform_b, tk_cfg.random_interval)
+                self._set_normal_waveforms(tk_cfg)
                 if tk_cfg.enabled:
                     intensity_a, intensity_b = MappingEngine.map_tank(
                         tk_data.speed_kmh,
@@ -434,8 +462,14 @@ class App:
         self._event_ch_a = ev["ch_a"]
         self._event_ch_b = ev["ch_b"]
         self._event_remaining = ev["duration"]
-        self.coyote.set_waveform_a(ev["wf_a"])
-        self.coyote.set_waveform_b(ev["wf_b"])
+        cfg = self._cfg.events if ev["mode"] == "aircraft" else self._cfg.tank_events
+        kind = ev["kind"]
+        catalog = getattr(self, "waveform_catalog", None)
+        choices = [name for name in catalog.choices() if name != "恒定"] if catalog else []
+        wf_a = random.choice(choices) if getattr(cfg, f"{kind}_random_a", False) and choices else ev["wf_a"]
+        wf_b = random.choice(choices) if getattr(cfg, f"{kind}_random_b", False) and choices else ev["wf_b"]
+        self.coyote.set_waveform_a(wf_a)
+        self.coyote.set_waveform_b(wf_b)
         if ev["kind"] == "kill":
             label = "⚔ 击杀!"
         elif ev["kind"] == "death":
@@ -495,8 +529,8 @@ class App:
         else:
             self._current_mode = self._cfg.app.mode
         # 清空悬浮窗缓存，避免旧模式数据残留
-        self._overlay_last_value = ""
-        self._overlay_last_unit = ""
+        self._overlay_last_g = ""
+        self._overlay_last_speed = ""
         logger.info(f"模式变更: current_mode={self._current_mode} cfg.mode={self._cfg.app.mode}")
         if hasattr(self, "window") and self.window is not None:
             self._apply_game_state(self._last_state)
@@ -538,9 +572,10 @@ class App:
 
     def _create_coyote_controller(self):
         """按当前配置创建 V3 或 V4 控制器。"""
+        catalog = getattr(self, "waveform_catalog", WaveformCatalog())
         if self._cfg.app.dglab_protocol == "v4":
-            return CoyoteV4Controller(self._cfg.app.v4_relay_url)
-        return CoyoteController(port=self._cfg.app.ws_port)
+            return CoyoteV4Controller(self._cfg.app.v4_relay_url, catalog)
+        return CoyoteController(port=self._cfg.app.ws_port, catalog=catalog)
 
     def _switch_coyote_protocol_if_needed(self) -> None:
         """设置保存后按需重建郊狼连接控制器。"""
@@ -573,20 +608,19 @@ class App:
         self.window.after(200, self._start_coyote)
 
     def _sync_overlay(self, mode: str, intensity_a: int, intensity_b: int):
-        """同步数据到悬浮窗"""
+        """同步数据到悬浮窗（按显示开关与数据有效性逐项显示）"""
         self._apply_overlay_settings()
         ov = self.overlay
         if not ov.visible:
             return
 
-        # 构建数据显示
+        # 当前输出波形名（控制器未就绪时显示恒定）
+        coyote = getattr(self, "coyote", None)
+        telemetry = getattr(coyote, "telemetry", None)
+        wave_a = telemetry.snapshot("A").name if telemetry is not None else "恒定"
+        wave_b = telemetry.snapshot("B").name if telemetry is not None else "恒定"
+
         last = self._last_state
-        if not last.connected:
-            self._overlay_last_value = ""
-            self._overlay_last_unit = ""
-            unit = "G" if mode == "aircraft" else "km/h"
-            ov.update(mode, "--", unit, 0, 0, "")
-            return
 
         event_text = ""
         if self._event_remaining > 0:
@@ -597,36 +631,113 @@ class App:
             elif self._event_kind == "death":
                 event_text = f"💀 坠毁! ({self._event_remaining:.1f}s)" if self._event_mode == "aircraft" else f"💀 被摧毁! ({self._event_remaining:.1f}s)"
 
-        value = "--"
-        unit = "G"
-        if mode == "aircraft":
+        # 每种模式只显示其触发指标：空战/CAS 显示过载，陆战地面显示速度；
+        # 未进对局或数据无效时显示 -- 占位，短暂无效沿用上次值防跳动
+        g_text = ""
+        speed_text = ""
+        if mode == "aircraft" or last.vehicle_type == "aircraft":
+            # 空战或陆战上飞机（CAS）：过载触发，清空速度缓存防跨上下文残留
+            self._overlay_last_speed = ""
             if last.aircraft and last.aircraft.valid:
-                value = f"{last.aircraft.gforce:.1f}"
-        else:
-            if last.vehicle_type == "aircraft" and last.aircraft and last.aircraft.valid:
-                # CAS: 陆战上飞机，显示过载
-                value = f"{last.aircraft.gforce:.1f}"
+                g_text = f"{last.aircraft.gforce:.1f}"
+                self._overlay_last_g = g_text
+            elif self._overlay_last_g:
+                g_text = self._overlay_last_g
             else:
-                unit = "km/h"
-                if last.tank and last.tank.valid:
-                    value = f"{last.tank.speed_kmh:.0f}"
-
-        # 数据短暂无效时沿用上次有效值，避免数值与 -- 之间来回跳动
-        if value == "--" and self._overlay_last_value:
-            value = self._overlay_last_value
-            unit = self._overlay_last_unit
-        elif value != "--":
-            self._overlay_last_value = value
-            self._overlay_last_unit = unit
+                g_text = "--"
+        elif mode == "tank":
+            # 陆战地面：速度触发，清空过载缓存防跨上下文残留
+            self._overlay_last_g = ""
+            if last.tank and last.tank.valid:
+                speed_text = f"{last.tank.speed_kmh:.0f}"
+                self._overlay_last_speed = speed_text
+            elif self._overlay_last_speed:
+                speed_text = self._overlay_last_speed
+            else:
+                speed_text = "--"
 
         # 仅在值变化时更新（减少闪烁）
-        ov.update(mode, value, unit, intensity_a, intensity_b, event_text)
+        ov.update(mode, g_text, speed_text, intensity_a, intensity_b,
+                  wave_a, wave_b, event_text)
+
+    def _overlay_content_flags(self) -> dict:
+        """从配置读取悬浮窗显示项开关。"""
+        app_cfg = self._cfg.app
+        return {
+            key: getattr(app_cfg, f"overlay_show_{key}")
+            for key in OVERLAY_CONTENT_FLAGS
+        }
+
+    def _apply_overlay_content(self, flags: dict) -> None:
+        """应用悬浮窗显示项开关：写配置 → 更新悬浮窗 → 持久化。"""
+        app_cfg = self._cfg.app
+        changed = False
+        for key in OVERLAY_CONTENT_FLAGS:
+            attr = f"overlay_show_{key}"
+            value = bool(flags.get(key, True))
+            if getattr(app_cfg, attr) != value:
+                setattr(app_cfg, attr, value)
+                changed = True
+        self.overlay.set_content_flags(flags)
+        if changed:
+            self.config_mgr.save()
+
+    def _open_overlay_content_dialog(self):
+        """打开（或置顶并同步）悬浮窗显示内容设置对话框。"""
+        dialog = self._overlay_content_dialog
+        flags = self._overlay_content_flags()
+        if dialog is None:
+            dialog = OverlayContentDialog(
+                flags,
+                on_change=self._apply_overlay_content,
+                parent=self.window,
+            )
+            self._overlay_content_dialog = dialog
+        else:
+            dialog.set_flags(flags)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _update_channel_wave_names(self):
+        """把控制器记录的当前波形名同步到仪表盘 A/B 通道卡。"""
+        coyote = getattr(self, "coyote", None)
+        telemetry = getattr(coyote, "telemetry", None)
+        if telemetry is None:
+            return
+        self.window.dashboard.channel_a.set_wave_name(
+            telemetry.snapshot("A").name)
+        self.window.dashboard.channel_b.set_wave_name(
+            telemetry.snapshot("B").name)
+
+    def _open_channel_scope(self, channel: str):
+        """打开（或置顶）对应通道的输出电压曲线窗口。"""
+        dialog = self._scope_dialogs.get(channel)
+        if dialog is None:
+            def telemetry_provider():
+                return getattr(getattr(self, "coyote", None), "telemetry", None)
+
+            def bound_provider():
+                coyote = getattr(self, "coyote", None)
+                status = getattr(coyote, "status", None)
+                return bool(status and status.bound)
+
+            dialog = ChannelScopeDialog(
+                channel,
+                telemetry_provider=telemetry_provider,
+                bound_provider=bound_provider,
+                parent=self.window,
+            )
+            self._scope_dialogs[channel] = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def _apply_overlay_settings(self):
         """立即应用悬浮窗开关和大小，并在变更时保存配置。"""
         ov = self.overlay
         want = self.window.dashboard.overlay_var.get()
-        size = self.window.overlay_size
+        px = self.window.overlay_value_font
         changed = False
 
         if want != ov.visible:
@@ -636,18 +747,22 @@ class App:
                 ov.hide()
             changed = True
 
-        if size != ov.get_size():
-            ov.set_size(size)
+        if px != ov.get_value_font():
+            ov.set_value_font(px)
             changed = True
 
         if self._cfg.app.overlay_enabled != want:
             self._cfg.app.overlay_enabled = want
             changed = True
-        if self._cfg.app.overlay_size != size:
-            self._cfg.app.overlay_size = size
+        if self._cfg.app.overlay_size_px != px:
+            self._cfg.app.overlay_size_px = px
             changed = True
         if changed:
             self.config_mgr.save()
+
+    def _on_overlay_value_font_changed(self, px: int):
+        """悬浮窗右键滑块拖动时同步主窗口滑块（同步过程会自动应用并保存）。"""
+        self.window.dashboard.set_overlay_value_font(px)
 
     def _apply_waveform(self):
         """根据当前模式同步波形设置到郊狼"""
@@ -658,8 +773,14 @@ class App:
             # 陆战模式先用坦克波形（后续会根据实际载具切 CAS）
             cfg = self._cfg.tank
         logger.info(f"同步波形: mode={mode} A={cfg.waveform_a} B={cfg.waveform_b}")
-        self.coyote.set_waveform_a(cfg.waveform_a, cfg.random_interval)
-        self.coyote.set_waveform_b(cfg.waveform_b, cfg.random_interval)
+        self._set_normal_waveforms(cfg)
+
+    def _set_normal_waveforms(self, cfg) -> None:
+        """将常规波形及 A/B 独立随机配置发送给控制器。"""
+        self.coyote.set_waveform_a(cfg.waveform_a, cfg.random_enabled_a,
+                                   cfg.random_min_a, cfg.random_max_a)
+        self.coyote.set_waveform_b(cfg.waveform_b, cfg.random_enabled_b,
+                                   cfg.random_min_b, cfg.random_max_b)
 
     def _start_coyote(self):
         """启动当前协议控制器并生成对应 App 配对二维码。"""

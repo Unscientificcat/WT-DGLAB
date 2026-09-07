@@ -16,12 +16,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..runtime_paths import resource_path
+
 
 def _get_project_root() -> str:
     """返回项目根目录，兼容源码和 PyInstaller 环境。"""
-    if getattr(sys, "frozen", False):
-        return sys._MEIPASS
-    return os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    return os.path.dirname(resource_path("注意事项.txt"))
 
 
 def _read_notice_text() -> str:

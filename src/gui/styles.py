@@ -28,16 +28,21 @@ FONTS = {
 
 STYLESHEET = f"""
 QMainWindow#appWindow, QWidget#appSurface {{
-    background: {COLORS['bg_main']};
+    background: transparent;
     color: {COLORS['text_primary']};
     font-family: {FONTS['default']};
     font-size: 13px;
 }}
-QFrame#headerBar, QFrame#dashboardPanel, QFrame#connectionPanel,
-QFrame#sectionCard, QFrame#noticeBottom {{
-    background: {COLORS['bg_panel']};
-    border: 1px solid {COLORS['border']};
+QFrame#headerBar, QFrame#dashboardPanel, QFrame#settingsPanel, QFrame#connectionPanel,
+QFrame#noticeBottom {{
+    background: transparent;
+    border: 0;
     border-radius: 8px;
+}}
+QFrame#sectionCard {{
+    background: transparent;
+    border: 0;
+    border-radius: 10px;
 }}
 QFrame#headerBar {{
     min-height: 62px;
@@ -101,9 +106,33 @@ QLabel#statusValue {{
     font-weight: 700;
 }}
 QFrame#channelCard {{
-    background: {COLORS['input']};
-    border: 1px solid {COLORS['border']};
+    background: transparent;
+    border: 0;
+}}
+QFrame#waveformHeader, QFrame#waveformNav, QFrame#waveformEditor,
+QFrame#waveformFooter {{
+    background: transparent;
+    border: 0;
+}}
+QFrame#waveformChannelCard {{
+    background: transparent;
+    border: 0;
+}}
+QListWidget#waveformSceneList {{
+    background: transparent;
+    border: 0;
+    outline: 0;
+    color: {COLORS['text_secondary']};
+}}
+QListWidget#waveformSceneList::item {{
+    padding: 10px 9px;
     border-radius: 6px;
+    margin: 2px 0;
+}}
+QListWidget#waveformSceneList::item:selected {{
+    color: {COLORS['primary']};
+    background: white;
+    font-weight: 700;
 }}
 QFrame#statusSeparator {{
     background: {COLORS['border']};
@@ -134,7 +163,7 @@ QProgressBar::chunk {{
 QProgressBar#channelB::chunk {{
     background: {COLORS['aqua']};
 }}
-QToolButton#modeButton, QToolButton#sizeButton {{
+QToolButton#modeButton, QToolButton#dashboardModeButton, QToolButton#sizeButton, QPushButton#modeButton {{
     color: {COLORS['text_secondary']};
     background: transparent;
     border: 1px solid transparent;
@@ -142,10 +171,33 @@ QToolButton#modeButton, QToolButton#sizeButton {{
     padding: 8px 12px;
     font-weight: 700;
 }}
-QToolButton#modeButton:checked, QToolButton#sizeButton:checked {{
+QToolButton#eventToggle {{
+    color: {COLORS['text_primary']};
+    background: rgba(255, 255, 255, 175);
+    border: 1px solid rgba(216, 227, 240, 200);
+    border-radius: 8px;
+    padding: 0 12px;
+    min-height: 38px;
+    text-align: left;
+    font-weight: 700;
+}}
+QToolButton#eventToggle:hover {{
+    background: rgba(255, 255, 255, 220);
+    border-color: rgba(75, 137, 216, 150);
+}}
+QToolButton#eventToggle:checked {{
+    background: rgba(237, 244, 252, 220);
+    border-color: {COLORS['primary']};
+    color: {COLORS['primary']};
+}}
+QToolButton#modeButton:checked, QToolButton#dashboardModeButton:checked, QToolButton#sizeButton:checked, QPushButton#modeButton:checked {{
     color: {COLORS['primary']};
     background: {COLORS['bg_soft']};
     border-color: {COLORS['border']};
+}}
+QToolButton#dashboardModeButton {{
+    padding: 1px 5px;
+    font-size: 12px;
 }}
 QPushButton {{
     background: {COLORS['primary']};
@@ -157,13 +209,13 @@ QPushButton {{
     font-weight: 700;
 }}
 QPushButton:hover {{ background: {COLORS['primary_hover']}; }}
-QPushButton#secondaryButton {{
+QPushButton#secondaryButton, QPushButton#overlayContentButton {{
     background: {COLORS['bg_panel']};
     color: {COLORS['primary']};
     border: 1px solid {COLORS['border']};
 }}
-QPushButton#secondaryButton:hover {{ background: {COLORS['bg_soft']}; }}
-QPushButton#textButton {{
+QPushButton#secondaryButton:hover, QPushButton#overlayContentButton:hover {{ background: {COLORS['bg_soft']}; }}
+QPushButton#textButton, QPushButton#aboutButton {{
     background: transparent;
     color: {COLORS['primary']};
     border: 0;
@@ -208,6 +260,13 @@ QLabel#formLabel {{
     color: {COLORS['text_secondary']};
 }}
 QScrollArea {{ border: 0; background: transparent; }}
+QScrollArea > QWidget#qt_scrollarea_viewport,
+QWidget#settingsContent, QStackedWidget#settingsPages,
+QWidget#appearancePage, QWidget#waveformPage, QWidget#collapsibleContent,
+QSplitter#mainSplitter, QFrame#protocolSelector {{
+    background: transparent;
+    border: 0;
+}}
 QScrollBar:vertical {{
     background: transparent;
     width: 10px;
@@ -223,6 +282,27 @@ QFrame#qrFrame {{
     background: white;
     border: 1px dashed {COLORS['border']};
     border-radius: 8px;
+}}
+QMenu#trayMenu {{
+    background: rgba(255, 255, 255, 245);
+    color: {COLORS['text_primary']};
+    border: 1px solid {COLORS['border']};
+    border-radius: 8px;
+    padding: 5px;
+}}
+QMenu#trayMenu::item {{ padding: 7px 22px 7px 12px; border-radius: 5px; }}
+QMenu#trayMenu::item:selected {{ background: {COLORS['bg_soft']}; color: {COLORS['primary']}; }}
+QMenu#overlaySizeMenu {{
+    background: rgba(255, 255, 255, 245);
+    color: {COLORS['text_primary']};
+    border: 1px solid {COLORS['border']};
+    border-radius: 8px;
+    padding: 4px;
+}}
+QMenu#overlaySizeMenu QLabel#overlaySizeValue {{
+    color: {COLORS['primary']};
+    font-weight: 700;
+    background: transparent;
 }}
 QTextBrowser#noticeText {{
     color: {COLORS['text_primary']};
@@ -249,6 +329,63 @@ QLabel#overlayValue {{
 QLabel#overlayA {{ color: {COLORS['pink']}; font-weight: 700; }}
 QLabel#overlayB {{ color: {COLORS['aqua']}; font-weight: 700; }}
 QLabel#overlayMode {{ color: {COLORS['primary']}; font-weight: 700; }}
+QLabel#overlayWave {{
+    color: {COLORS['text_secondary']};
+    font-weight: 600;
+}}
+QLabel#channelWaveName {{
+    color: {COLORS['text_secondary']};
+    font-size: 11px;
+}}
+QLabel#channelWaveHint {{
+    color: {COLORS['text_secondary']};
+    font-size: 11px;
+}}
+QDialog#channelScopeDialog {{
+    background: {COLORS['bg_panel']};
+}}
+QLabel#scopeInfoLabel {{
+    color: {COLORS['text_secondary']};
+    font-size: 13px;
+    font-weight: 700;
+}}
+QDialog#overlayContentDialog {{
+    background: {COLORS['bg_panel']};
+}}
+QDialog#aboutDialog {{
+    background: {COLORS['bg_panel']};
+}}
+QLabel#aboutTitle {{
+    color: {COLORS['text_primary']};
+    font-size: 19px;
+    font-weight: 700;
+}}
+QLabel#aboutSubtitle {{
+    color: {COLORS['text_secondary']};
+    font-size: 11px;
+    font-weight: 700;
+}}
+QLabel#aboutVersion {{
+    color: {COLORS['primary']};
+    font-size: 13px;
+    font-weight: 700;
+}}
+QLabel#aboutInfo {{
+    color: {COLORS['text_primary']};
+    font-weight: 600;
+}}
+QLabel#aboutLink {{
+    color: {COLORS['text_primary']};
+}}
+QLabel#aboutNote {{
+    color: {COLORS['text_secondary']};
+    font-size: 11px;
+}}
+QFrame#aboutSeparator {{
+    background: {COLORS['border']};
+    max-height: 1px;
+    border: 0;
+}}
 """
 
 

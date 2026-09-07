@@ -4,8 +4,15 @@ import queue
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import requests
+
 from main import App
-from src.config_manager import CasSettings, TankEventSettings
+from src.config_manager import (
+    AircraftSettings,
+    CasSettings,
+    TankEventSettings,
+    TankSettings,
+)
 from src.game_reader import AircraftData, GameReader, GameState, TankData
 
 
@@ -56,12 +63,102 @@ def test_menu_stale_indicators_do_not_create_tank_data():
     state = reader.fetch()
 
     assert not state.connected
+    assert state.link_ok
     assert state.vehicle_type == ""
     assert state.tank is None
     assert reader._session.calls == [
         GameReader.STATE_URL,
         GameReader.MAP_INFO_URL,
     ]
+
+
+def test_unreachable_game_reports_link_down():
+    """战争雷霆未运行（连接拒绝）时 link_ok 为 False。"""
+
+    class RaisingSession:
+        def get(self, url, timeout):
+            raise requests.ConnectionError("connection refused")
+
+    reader = GameReader()
+    reader._session = RaisingSession()
+
+    state = reader.fetch()
+
+    assert not state.link_ok
+    assert not state.connected
+
+
+def test_main_menu_shows_connected_but_zeroes_output():
+    """主菜单：8111 可达即状态灯绿色，输出仍安全归零。"""
+    app = App.__new__(App)
+    app.config_mgr = SimpleNamespace(config=SimpleNamespace(
+        aircraft=AircraftSettings(),
+        tank=TankSettings(),
+        cas=CasSettings(),
+        events=SimpleNamespace(),
+        tank_events=TankEventSettings(),
+    ))
+    app._last_state = GameState()
+    app._wt_fail_count = 0
+    app._wt_connected = False
+    app._event_kind = ""
+    app._event_mode = ""
+    app._event_ch_a = 0
+    app._event_ch_b = 0
+    app._event_remaining = 0.0
+    app._overlay_tick = 0
+    app._overlay_last_g = ""
+    app._overlay_last_speed = ""
+    app.coyote = SimpleNamespace(status=SimpleNamespace(bound=False))
+    app._sync_overlay = Mock()
+    app.window = SimpleNamespace(
+        get_mode=Mock(return_value="aircraft"),
+        status_bar=SimpleNamespace(set_wt_status=Mock()),
+        dashboard=SimpleNamespace(clear=Mock(), show_event=Mock()),
+    )
+
+    app._apply_game_state(GameState(link_ok=True))
+
+    app.window.status_bar.set_wt_status.assert_called_once_with(True)
+    app.window.dashboard.clear.assert_called_once_with("aircraft")
+
+
+def test_status_light_turns_red_after_three_failed_polls():
+    """连续 3 次 8111 不可达后状态灯变红（防抖）。"""
+    app = App.__new__(App)
+    app.config_mgr = SimpleNamespace(config=SimpleNamespace(
+        aircraft=AircraftSettings(),
+        tank=TankSettings(),
+        cas=CasSettings(),
+        events=SimpleNamespace(),
+        tank_events=TankEventSettings(),
+    ))
+    app._last_state = GameState()
+    app._wt_fail_count = 0
+    app._wt_connected = True
+    app._event_kind = ""
+    app._event_mode = ""
+    app._event_ch_a = 0
+    app._event_ch_b = 0
+    app._event_remaining = 0.0
+    app._overlay_tick = 0
+    app._overlay_last_g = ""
+    app._overlay_last_speed = ""
+    app.coyote = SimpleNamespace(status=SimpleNamespace(bound=False))
+    app._sync_overlay = Mock()
+    app.window = SimpleNamespace(
+        get_mode=Mock(return_value="aircraft"),
+        status_bar=SimpleNamespace(set_wt_status=Mock()),
+        dashboard=SimpleNamespace(clear=Mock(), show_event=Mock()),
+    )
+    offline_state = GameState()
+
+    app._apply_game_state(offline_state)
+    app._apply_game_state(offline_state)
+    app.window.status_bar.set_wt_status.assert_not_called()
+
+    app._apply_game_state(offline_state)
+    app.window.status_bar.set_wt_status.assert_called_with(False)
 
 
 def test_active_tank_uses_complete_map_metadata_when_valid_flag_is_omitted():
@@ -104,8 +201,8 @@ def test_inactive_state_cancels_event_and_forces_zero_output():
     app._event_ch_a = 100
     app._event_ch_b = 120
     app._event_remaining = 5.0
-    app._overlay_last_value = "68"
-    app._overlay_last_unit = "km/h"
+    app._overlay_last_g = "3.5"
+    app._overlay_last_speed = "68"
     app._send_strength = Mock()
     app._sync_overlay = Mock()
     app._apply_waveform = Mock()
@@ -126,8 +223,8 @@ def test_inactive_state_cancels_event_and_forces_zero_output():
     assert app._event_kind == ""
     assert app._event_ch_a == 0
     assert app._event_ch_b == 0
-    assert app._overlay_last_value == ""
-    assert app._overlay_last_unit == ""
+    assert app._overlay_last_g == ""
+    assert app._overlay_last_speed == ""
 
 
 def test_overlay_never_reuses_a_value_after_telemetry_becomes_invalid():
@@ -135,15 +232,21 @@ def test_overlay_never_reuses_a_value_after_telemetry_becomes_invalid():
     app = App.__new__(App)
     app._apply_overlay_settings = Mock()
     app._last_state = GameState()
-    app._overlay_last_value = "68"
-    app._overlay_last_unit = "km/h"
+    # 真实流程中 _apply_game_state 会在对局失效时先清空缓存再调用本方法
+    app._overlay_last_g = ""
+    app._overlay_last_speed = ""
+    app._event_remaining = 0.0
+    app._event_kind = ""
+    app._event_mode = ""
     app.overlay = SimpleNamespace(visible=True, update=Mock())
 
-    app._sync_overlay("tank", 80, 100)
+    # 真实流程中 _apply_game_state 对局失效时以 (mode, 0, 0) 调用
+    app._sync_overlay("tank", 0, 0)
 
-    app.overlay.update.assert_called_once_with("tank", "--", "km/h", 0, 0, "")
-    assert app._overlay_last_value == ""
-    assert app._overlay_last_unit == ""
+    app.overlay.update.assert_called_once_with(
+        "tank", "", "--", 0, 0, "恒定", "恒定", "")
+    assert app._overlay_last_g == ""
+    assert app._overlay_last_speed == ""
 
 
 def test_event_tick_reuses_last_state_when_no_new_telemetry_is_queued():

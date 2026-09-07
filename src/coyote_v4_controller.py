@@ -13,7 +13,8 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 import websockets
 
 from .coyote_controller import CoyoteStatus
-from .waveforms import WaveformPlayer, random_waveform_name
+from .output_telemetry import OutputTelemetry
+from .waveforms import WaveformCatalog, WaveformPlayer
 
 
 logger = logging.getLogger("CoyoteV4Controller")
@@ -26,7 +27,7 @@ COYOTE_DEVICE_TYPES = {"COYOTE_020", "COYOTE_030"}
 class CoyoteV4Controller:
     """通过 V4 Relay 控制 DG-LAB 4.x App 暴露的郊狼设备。"""
 
-    def __init__(self, relay_url: str = DEFAULT_RELAY_URL):
+    def __init__(self, relay_url: str = DEFAULT_RELAY_URL, catalog: WaveformCatalog | None = None):
         self._relay_url = self.normalize_relay_url(relay_url)
         self._status = CoyoteStatus()
         self._cmd_queue: queue.Queue = queue.Queue()
@@ -44,10 +45,15 @@ class CoyoteV4Controller:
         self._qr_url = ""
         self._request_counter = 0
         self._last_strength = {"A": 0, "B": 0}
-
-        self._player_a = WaveformPlayer("恒定")
-        self._player_b = WaveformPlayer("恒定")
+        self._catalog = catalog or WaveformCatalog()
+        self._catalog.reload()
+        self._player_a = WaveformPlayer("恒定", self._catalog)
+        self._player_b = WaveformPlayer("恒定", self._catalog)
         self._random_tasks: dict[str, asyncio.Task] = {}
+        self._waveform_configs: dict[str, tuple] = {}
+
+        # 输出遥测（波形名 + 下发批次），供界面显示当前波形和电压曲线
+        self.telemetry = OutputTelemetry()
 
     @property
     def status(self) -> CoyoteStatus:
@@ -64,6 +70,11 @@ class CoyoteV4Controller:
         if self._running:
             return self._status.server_running
 
+        while not self._result_queue.empty():
+            try:
+                self._result_queue.get_nowait()
+            except queue.Empty:
+                break
         self._running = True
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
@@ -74,12 +85,24 @@ class CoyoteV4Controller:
             self.stop()
             return False
 
-    def stop(self) -> None:
-        """停止 V4 控制器并关闭 Relay 连接。"""
+    def stop(self, wait: bool = True) -> None:
+        """归零并停止 V4 控制器，可等待后台线程完成清理。"""
         self._running = False
         loop = self._loop
         if loop and loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._close_websocket(), loop)
+            future = asyncio.run_coroutine_threadsafe(
+                self._close_websocket(), loop
+            )
+            if wait:
+                try:
+                    future.result(timeout=3)
+                except Exception as error:
+                    logger.warning(f"V4 停止清理未完成: {error}")
+        else:
+            self._running = False
+        if (wait and self._thread and self._thread.is_alive()
+                and threading.current_thread() is not self._thread):
+            self._thread.join(timeout=3)
 
     def get_qrcode_url(self, ip: str = "") -> str:
         """返回 DG-LAB 4 App 可识别的官方配对链接。"""
@@ -99,13 +122,15 @@ class CoyoteV4Controller:
         self.set_strength_a(0)
         self.set_strength_b(0)
 
-    def set_waveform_a(self, name: str, random_interval: int = 30) -> None:
+    def set_waveform_a(self, name: str, random_enabled: bool = False,
+                       random_min: int = 30, random_max: int = 50) -> None:
         """切换 A 通道波形。"""
-        self._send_cmd(("waveform", "A", name, random_interval))
+        self._send_cmd(("waveform", "A", name, bool(random_enabled), int(random_min), int(random_max)))
 
-    def set_waveform_b(self, name: str, random_interval: int = 30) -> None:
+    def set_waveform_b(self, name: str, random_enabled: bool = False,
+                       random_min: int = 30, random_max: int = 50) -> None:
         """切换 B 通道波形。"""
-        self._send_cmd(("waveform", "B", name, random_interval))
+        self._send_cmd(("waveform", "B", name, bool(random_enabled), int(random_min), int(random_max)))
 
     @staticmethod
     def normalize_relay_url(relay_url: str) -> str:
@@ -133,14 +158,20 @@ class CoyoteV4Controller:
         return app_socket_url, pairing_url
 
     @staticmethod
-    def pulse_to_hex(pulse, strength: int) -> str:
-        """将项目波形帧转换为 V4 郊狼八字节十六进制帧。"""
-        frequencies, amplitudes = pulse
+    def scaled_amplitudes(pulse, strength: int) -> tuple[int, ...]:
+        """将项目波形帧幅度按强度比例缩放为 0-100 的最终幅度。"""
+        _frequencies, amplitudes = pulse
         scale = CoyoteV4Controller._clamp_strength(strength) / 200.0
-        values = [max(0, min(240, int(value))) for value in frequencies]
-        values.extend(
+        return tuple(
             max(0, min(100, int(value * scale))) for value in amplitudes
         )
+
+    @staticmethod
+    def pulse_to_hex(pulse, strength: int) -> str:
+        """将项目波形帧转换为 V4 郊狼八字节十六进制帧。"""
+        frequencies, _amplitudes = pulse
+        values = [max(0, min(240, int(value))) for value in frequencies]
+        values.extend(CoyoteV4Controller.scaled_amplitudes(pulse, strength))
         return "".join(f"{value:02X}" for value in values)
 
     @staticmethod
@@ -346,8 +377,10 @@ class CoyoteV4Controller:
         channel = command[1]
         if command_type == "waveform":
             name = command[2]
-            interval = command[3] if len(command) > 3 else 30
-            self._set_waveform(channel, name, interval)
+            enabled = bool(command[3]) if len(command) > 3 else False
+            minimum = int(command[4]) if len(command) > 4 else 30
+            maximum = int(command[5]) if len(command) > 5 else minimum
+            self._set_waveform(channel, name, enabled, minimum, maximum)
             return
         if command_type != "strength" or not self._status.bound:
             return
@@ -369,15 +402,19 @@ class CoyoteV4Controller:
         if target > 0:
             await self._send_waveform(channel, target)
 
-    def _set_waveform(self, channel: str, name: str, interval: int) -> None:
+    def _set_waveform(self, channel: str, name: str, enabled: bool = False,
+                      minimum: int = 30, maximum: int = 50) -> None:
         """更新本地波形播放器和随机切换任务。"""
+        config_key = (name, enabled, minimum, maximum)
+        if self._waveform_configs.get(channel) == config_key:
+            return
+        self._waveform_configs[channel] = config_key
         player = self._player_a if channel == "A" else self._player_b
-        if name == "随机":
-            player.set_waveform(random_waveform_name())
-            self._start_random_task(channel, interval)
-        else:
-            self._stop_random_task(channel)
-            player.set_waveform(name)
+        self._stop_random_task(channel)
+        player.set_waveform(name)
+        self.telemetry.record_waveform(channel, player.current_name)
+        if enabled:
+            self._start_random_task(channel, minimum, maximum)
 
     async def _send_waveform(self, channel: str, strength: int) -> None:
         """下发一秒可立即替换的 V4 郊狼波形任务。"""
@@ -399,11 +436,14 @@ class CoyoteV4Controller:
             "v": [frame] * 10,
             "im": True,
         })
+        self.telemetry.record_pulse(
+            channel, self.scaled_amplitudes(pulse, strength), strength)
 
     async def _reset_channel(self, channel: str) -> None:
         """将指定通道强度安全归零。"""
         await self._send_operation(channel, {"t": 7, "v": 0, "im": True})
         self._last_strength[channel] = 0
+        self.telemetry.record_silence(channel)
 
     async def _clear_channel(self, channel: str) -> None:
         """清理指定设备通道上的 V4 操作任务。"""
@@ -477,6 +517,7 @@ class CoyoteV4Controller:
         self._device_name = ""
         self._last_strength = {"A": 0, "B": 0}
         self._status.bound = False
+        self.telemetry.reset()
         if not keep_client:
             self._client_id = ""
             self._status.client_connected = False
@@ -495,6 +536,8 @@ class CoyoteV4Controller:
         self._device_name = ""
         self._qr_url = ""
         self._last_strength = {"A": 0, "B": 0}
+        self._waveform_configs.clear()
+        self.telemetry.reset()
         while not self._cmd_queue.empty():
             try:
                 self._cmd_queue.get_nowait()
@@ -516,11 +559,11 @@ class CoyoteV4Controller:
         """将项目通道名转换为 V4 通道编号。"""
         return 0 if channel == "A" else 1
 
-    def _start_random_task(self, channel: str, interval: int) -> None:
+    def _start_random_task(self, channel: str, minimum: int, maximum: int) -> None:
         """启动指定通道的随机波形切换任务。"""
         self._stop_random_task(channel)
         self._random_tasks[channel] = asyncio.create_task(
-            self._random_waveform_loop(channel, max(5, int(interval)))
+            self._random_waveform_loop(channel, minimum, maximum)
         )
 
     def _stop_random_task(self, channel: str) -> None:
@@ -530,9 +573,12 @@ class CoyoteV4Controller:
             task.cancel()
 
     async def _random_waveform_loop(self, channel: str,
-                                    interval: int) -> None:
+                                    minimum: int, maximum: int) -> None:
         """定时为一个通道选择新的随机波形。"""
         player = self._player_a if channel == "A" else self._player_b
         while self._running:
-            await asyncio.sleep(interval)
-            player.set_waveform(random_waveform_name(player.current_name))
+            await asyncio.sleep(random.uniform(max(5, minimum), max(maximum, minimum)))
+            choices = [item for item in self._catalog.choices() if item != "恒定"]
+            if choices:
+                player.set_waveform(random.choice([item for item in choices if item != player.current_name] or choices))
+                self.telemetry.record_waveform(channel, player.current_name)

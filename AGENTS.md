@@ -61,6 +61,7 @@ WT-DGLAB/
 │   ├── gui/
 │   │   ├── __init__.py
 │   │   ├── main_window.py      # 主窗口 UI
+│   │   ├── glass.py            # 玻璃背景缓存与卡片绘制
 │   │   └── styles.py           # 淡蓝色 QSS 样式
 │   ├── config_manager.py       # JSON 配置读写
 │   ├── game_reader.py          # WT 8111 数据读取（阶段2）

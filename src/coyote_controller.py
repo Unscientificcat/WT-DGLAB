@@ -23,7 +23,8 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from .waveforms import WaveformPlayer, ALL_WAVEFORMS, random_waveform_name
+from .output_telemetry import OutputTelemetry
+from .waveforms import WaveformCatalog, WaveformPlayer
 
 logger = logging.getLogger("CoyoteController")
 
@@ -53,7 +54,7 @@ class CoyoteController:
     主线程通过同步方法发送命令。
     """
 
-    def __init__(self, port: int = 8765):
+    def __init__(self, port: int = 8765, catalog: WaveformCatalog | None = None):
         self._port = port
         self._status = CoyoteStatus()
 
@@ -77,9 +78,15 @@ class CoyoteController:
         self._last_pulse_b: int = -1
 
         # 波形播放器
-        self._player_a = WaveformPlayer("恒定")
-        self._player_b = WaveformPlayer("恒定")
+        self._catalog = catalog or WaveformCatalog()
+        self._catalog.reload()
+        self._player_a = WaveformPlayer("恒定", self._catalog)
+        self._player_b = WaveformPlayer("恒定", self._catalog)
         self._random_tasks: dict = {}  # {"A": task, "B": task}
+        self._waveform_configs: dict[str, tuple] = {}
+
+        # 输出遥测（波形名 + 下发批次），供界面显示当前波形和电压曲线
+        self.telemetry = OutputTelemetry()
 
     # ============================================================
     # 公开 API（主线程调用）
@@ -104,6 +111,11 @@ class CoyoteController:
         if self._running:
             return True
 
+        while not self._result_queue.empty():
+            try:
+                self._result_queue.get_nowait()
+            except queue.Empty:
+                break
         self._running = True
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
@@ -114,13 +126,27 @@ class CoyoteController:
             return result is True
         except queue.Empty:
             self._status.error = "服务启动超时"
+            self.stop()
             return False
 
-    def stop(self):
-        """停止服务端"""
-        self._running = False
-        if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._cancel_main_task)
+    def stop(self, wait: bool = True):
+        """归零并停止服务端，可等待后台线程完成清理。"""
+        loop = self._loop
+        if loop and loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(
+                self._safe_stop(), loop
+            )
+            if wait:
+                try:
+                    future.result(timeout=3)
+                except Exception as error:
+                    logger.warning(f"V3 停止清理未完成: {error}")
+        else:
+            self._running = False
+            self._waveform_configs.clear()
+        if (wait and self._thread and self._thread.is_alive()
+                and threading.current_thread() is not self._thread):
+            self._thread.join(timeout=3)
 
     def get_qrcode_url(self, ip: str = "") -> str:
         """获取二维码 URL（由 PyDGLab-WS 客户端生成，非简单 ws:// 地址）
@@ -153,13 +179,15 @@ class CoyoteController:
         self.set_strength_a(0)
         self.set_strength_b(0)
 
-    def set_waveform_a(self, name: str, random_interval: int = 30):
+    def set_waveform_a(self, name: str, random_enabled: bool = False,
+                       random_min: int = 30, random_max: int = 50):
         """设置 A 通道波形"""
-        self._send_cmd(("waveform", "A", name, random_interval))
+        self._send_cmd(("waveform", "A", name, bool(random_enabled), int(random_min), int(random_max)))
 
-    def set_waveform_b(self, name: str, random_interval: int = 30):
+    def set_waveform_b(self, name: str, random_enabled: bool = False,
+                       random_min: int = 30, random_max: int = 50):
         """设置 B 通道波形"""
-        self._send_cmd(("waveform", "B", name, random_interval))
+        self._send_cmd(("waveform", "B", name, bool(random_enabled), int(random_min), int(random_max)))
 
     # ============================================================
     # 内部方法
@@ -213,6 +241,8 @@ class CoyoteController:
             self._status.client_connected = False
             self._status.bound = False
             self._running = False
+            self._waveform_configs.clear()
+            self.telemetry.reset()
             loop.close()
             logger.info("郊狼服务端已停止")
 
@@ -220,6 +250,17 @@ class CoyoteController:
         """在 V3 事件循环线程中取消服务主协程。"""
         if self._main_task and not self._main_task.done():
             self._main_task.cancel()
+
+    async def _safe_stop(self) -> None:
+        """在取消服务协程前尽力归零并清理两个通道。"""
+        self._running = False
+        if self._client and self._status.bound:
+            try:
+                await self._exec_command(("strength", "A", 0))
+                await self._exec_command(("strength", "B", 0))
+            except Exception as error:
+                logger.warning(f"V3 通道归零失败: {error}")
+        self._cancel_main_task()
 
     async def _async_main(self):
         """异步主函数 — 官方 Socket 协议流程"""
@@ -368,22 +409,19 @@ class CoyoteController:
         if cmd_type == "waveform":
             channel_str = cmd[1]
             name = cmd[2]
-            interval = cmd[3] if len(cmd) > 3 else 30
-            if name == "随机":
-                name = random_waveform_name()
-                # 启动该通道的随机切换任务
-                if channel_str == "A":
-                    self._start_channel_random("A", interval)
-                else:
-                    self._start_channel_random("B", interval)
-            elif channel_str == "A":
-                self._stop_channel_random("A")
-            else:
-                self._stop_channel_random("B")
-            if channel_str == "A":
-                self._player_a.set_waveform(name)
-            else:
-                self._player_b.set_waveform(name)
+            enabled = bool(cmd[3]) if len(cmd) > 3 else False
+            minimum = int(cmd[4]) if len(cmd) > 4 else 30
+            maximum = int(cmd[5]) if len(cmd) > 5 else minimum
+            config_key = (name, enabled, minimum, maximum)
+            if self._waveform_configs.get(channel_str) == config_key:
+                return
+            self._waveform_configs[channel_str] = config_key
+            self._stop_channel_random(channel_str)
+            player = self._player_a if channel_str == "A" else self._player_b
+            player.set_waveform(name)
+            self.telemetry.record_waveform(channel_str, player.current_name)
+            if enabled:
+                self._start_channel_random(channel_str, minimum, maximum)
             return
 
         if cmd_type != "strength":
@@ -412,6 +450,7 @@ class CoyoteController:
                 self._last_pulse_b = value
         else:
             await self._client.clear_pulses(channel)
+            self.telemetry.record_silence(channel_str)
             if channel_str == "A":
                 self._last_pulse_a = 0
             else:
@@ -420,11 +459,15 @@ class CoyoteController:
     async def _send_waveform_pulse(self, channel, strength: int):
         """从波形播放器取一条 pulse，按强度缩放后发送"""
         player = self._player_a if channel.name == "A" else self._player_b
+        channel_str = "A" if channel.name == "A" else "B"
 
         if player.is_constant:
             # 恒定模式：固定频率 + 均匀强度
             wave_strength = max(0, min(100, strength // 2))
             if wave_strength == 0:
+                # 强度 1-2 时恒定输出为零，记录零幅度批次保持曲线连续
+                self.telemetry.record_pulse(
+                    channel_str, (0, 0, 0, 0), strength)
                 return
             if strength <= 50:
                 freq = 10
@@ -447,11 +490,12 @@ class CoyoteController:
 
         pulses = tuple(pulse for _ in range(10))
         await self._client.add_pulses(channel, *pulses)
+        self.telemetry.record_pulse(channel_str, pulse[1], strength)
 
-    def _start_channel_random(self, ch: str, interval: int):
+    def _start_channel_random(self, ch: str, minimum: int, maximum: int):
         """启动单通道随机波形切换"""
         self._stop_channel_random(ch)
-        task = asyncio.ensure_future(self._channel_random_loop(ch, interval))
+        task = asyncio.ensure_future(self._channel_random_loop(ch, minimum, maximum))
         self._random_tasks[ch] = task
 
     def _stop_channel_random(self, ch: str):
@@ -459,13 +503,15 @@ class CoyoteController:
         if task and not task.done():
             task.cancel()
 
-    async def _channel_random_loop(self, ch: str, interval: int):
+    async def _channel_random_loop(self, ch: str, minimum: int, maximum: int):
         """单通道随机波形切换循环"""
         player = self._player_a if ch == "A" else self._player_b
         while self._running:
-            await asyncio.sleep(interval)
-            new_name = random_waveform_name(
-                player.current_name if not player.is_constant else None
-            )
+            await asyncio.sleep(random.uniform(max(5, minimum), max(maximum, minimum)))
+            choices = [item for item in self._catalog.choices() if item != "恒定"]
+            if not choices:
+                continue
+            new_name = random.choice([item for item in choices if item != player.current_name] or choices)
             player.set_waveform(new_name)
+            self.telemetry.record_waveform(ch, player.current_name)
             logger.info(f"随机波形: 通道{ch} → {new_name}")

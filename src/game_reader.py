@@ -11,6 +11,7 @@
 """
 
 import json
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -53,6 +54,7 @@ class TankData:
 class GameState:
     """综合游戏状态"""
     connected: bool = False          # 是否处于已确认的有效对局，可安全驱动输出
+    link_ok: bool = False            # 战争雷霆 8111 遥测服务是否可达（主菜单也为 True）
     vehicle_type: str = ""           # "aircraft" / "tank" / "" (未知)
     aircraft: Optional[AircraftData] = None
     tank: Optional[TankData] = None
@@ -127,6 +129,10 @@ class GameReader:
         except (requests.ConnectionError, requests.Timeout,
                 requests.RequestException, json.JSONDecodeError):
             return state
+
+        # /state 可达即代表战争雷霆遥测服务在线（主菜单同样为 True），
+        # 仅用于状态栏连接显示；对局判定仍以 map_info 为准。
+        state.link_ok = True
 
         # /indicators 会在退出对局后保留最后一帧数据，不能单独用于驱动设备。
         # /map_info.json 在未处于对局时返回 {"valid": false}；有效对局则
@@ -295,12 +301,24 @@ class GameReader:
         data.vehicle_name = str(indicators_json.get("type", ""))
 
         if indicators_json:
-            data.speed_kmh = float(indicators_json.get("speed", 0))
-            data.is_repairing = (indicators_json.get("is_repairing") is not None
-                                 and float(indicators_json.get("is_repairing", 0)) > 0)
-            data.repair_time = float(indicators_json.get("repair_time", 0))
+            data.speed_kmh = self._safe_float(indicators_json.get("speed"))
+            data.is_repairing = (
+                self._safe_float(indicators_json.get("is_repairing")) > 0
+            )
+            data.repair_time = self._safe_float(
+                indicators_json.get("repair_time")
+            )
 
         return data
+
+    @staticmethod
+    def _safe_float(value, default: float = 0.0) -> float:
+        """将接口字段转换为有限浮点数，异常值回退为默认值。"""
+        try:
+            result = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return default
+        return result if math.isfinite(result) else default
 
     def _extract_damage_from_indicators(self, indicators_json: dict) -> list:
         """从 /indicators 数据中提取部件/乘员损伤

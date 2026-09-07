@@ -172,6 +172,175 @@ def test_death_messages_are_detected(message):
     assert event["ch_a"] == 13
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "玩家 (Spitfire) shot down Enemy (Bf 109)",
+        "玩家 (T-34) destroyed Enemy (Panther)",
+        "玩家 (Yak-3) сбил Enemy (Bf 109)",
+        "玩家 (T-34) уничтожил Enemy (Panther)",
+        "玩家 (Mirage) abattu Enemy (MiG-21)",
+        "玩家 (Leclerc) détruit Enemy (T-80)",
+        "玩家 (F-4F) abgeschossen Enemy (MiG-23)",
+        "玩家 (Leopard) zerstört Enemy (T-72)",
+        "玩家 (M1A1) 击毁了 Enemy (T-62)",
+        "玩家 (M1A1) 擊毀了 Enemy (T-62)",
+        "玩家 (F-15J) 撃墜されました Enemy (Su-27)",
+        "玩家 (Type 90) によって\t撃破されました Enemy (T-80)",
+    ],
+)
+def test_active_multilingual_kill_messages(message):
+    """七种目标语言的主动击落和击毁格式均识别为击杀。"""
+    reader = QueuedReader([
+        (True, []),
+        (True, [{"id": 1, "msg": message}]),
+    ])
+    detector = EventDetector(reader)
+    aircraft, tank = make_configs()
+
+    detector.poll(GameState(), "tank", aircraft, tank)
+    event = detector.poll(active_state(), "tank", aircraft, tank)
+
+    assert event["kind"] == "kill"
+    assert event["ch_a"] == 21
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Enemy (Spitfire) shot down 玩家 (Bf 109)",
+        "Enemy (T-34) destroyed 玩家 (Panther)",
+        "Enemy (Yak-3) сбил 玩家 (Bf 109)",
+        "Enemy (T-34) уничтожил 玩家 (Panther)",
+        "Enemy (Mirage) abattu 玩家 (MiG-21)",
+        "Enemy (Leclerc) détruit 玩家 (T-80)",
+        "Enemy (F-4F) abgeschossen 玩家 (MiG-23)",
+        "Enemy (Leopard) zerstört 玩家 (T-72)",
+        "Enemy (M1A1) 击毁了 玩家 (T-62)",
+        "Enemy (M1A1) 擊毀了 玩家 (T-62)",
+        "Enemy (F-15J) 撃墜されました 玩家 (Su-27)",
+        "Enemy (Type 90) によって\t撃破されました 玩家 (T-80)",
+    ],
+)
+def test_active_multilingual_death_messages(message):
+    """七种目标语言的主动击落和击毁格式均能识别玩家死亡。"""
+    reader = QueuedReader([
+        (True, []),
+        (True, [{"id": 1, "msg": message}]),
+    ])
+    detector = EventDetector(reader)
+    aircraft, tank = make_configs()
+
+    detector.poll(GameState(), "tank", aircraft, tank)
+    event = detector.poll(active_state(), "tank", aircraft, tank)
+
+    assert event["kind"] == "death"
+    assert event["ch_a"] == 23
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "玩家 (Spitfire) has crashed.",
+        "玩家 (Yak-3) разбился",
+        "玩家 (Mirage) s'est écrasé.",
+        "玩家 (F-4F) ist abgestürzt.",
+        "玩家的载具已坠毁。",
+        "玩家的載具已墜毀",
+        "玩家 (F-15J) は\t墜落しました",
+    ],
+)
+def test_multilingual_crash_messages(message):
+    """七种目标语言的自行坠毁格式均识别为死亡。"""
+    reader = QueuedReader([
+        (True, []),
+        (True, [{"id": 1, "msg": message}]),
+    ])
+    detector = EventDetector(reader)
+    aircraft, tank = make_configs()
+
+    detector.poll(GameState(), "aircraft", aircraft, tank)
+    event = detector.poll(active_state("aircraft"), "aircraft", aircraft, tank)
+
+    assert event["kind"] == "death"
+    assert event["ch_a"] == 13
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_kind"),
+    [
+        ("玩家 (Spitfire) shot down by Enemy (Bf 109)", "death"),
+        ("Enemy (Spitfire) shot down by 玩家 (Bf 109)", "kill"),
+        ("玩家 (Mirage) abattu par Enemy (MiG-21)", "death"),
+        ("Enemy (Mirage) abattu par 玩家 (MiG-21)", "kill"),
+        ("玩家 (F-4F) wurde abgeschossen von Enemy", "death"),
+        ("Enemy wurde abgeschossen von 玩家 (F-4F)", "kill"),
+        ("玩家 (Yak-3) сбит игроком Enemy", "death"),
+        ("Enemy сбит игроком 玩家 (Yak-3)", "kill"),
+        ("玩家已被击落，攻击者为 Enemy", "death"),
+        ("Enemy 已被击落，攻击者为 玩家", "kill"),
+        ("玩家已被擊落，攻擊者是 Enemy", "death"),
+        ("Enemy 已被擊落，攻擊者是 玩家", "kill"),
+    ],
+)
+def test_passive_multilingual_messages(message, expected_kind):
+    """被动格式按玩家在关系词前后正确区分死亡和击杀。"""
+    reader = QueuedReader([
+        (True, []),
+        (True, [{"id": 1, "msg": message}]),
+    ])
+    detector = EventDetector(reader)
+    aircraft, tank = make_configs()
+
+    detector.poll(GameState(), "tank", aircraft, tank)
+    event = detector.poll(active_state(), "tank", aircraft, tank)
+
+    assert event["kind"] == expected_kind
+
+
+def test_damage_and_fire_messages_do_not_trigger_events():
+    """普通损伤和点燃记录不能误报为击杀。"""
+    reader = QueuedReader([
+        (True, []),
+        (True, [
+            {"id": 1, "msg": "玩家 (Yak-141) damaged Enemy (BV 238)"},
+            {"id": 2, "msg": "玩家 (Yak-141) set afire Enemy (BV 238)"},
+        ]),
+    ])
+    detector = EventDetector(reader)
+    aircraft, tank = make_configs()
+
+    detector.poll(GameState(), "aircraft", aircraft, tank)
+    event = detector.poll(active_state("aircraft"), "aircraft", aircraft, tank)
+
+    assert event == {}
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "=CLAN= TestPilot (◍\u200bM1A1 HC) 击\u200b毁\u200b了 IT-1",
+        "=CLAN= TestPilot (◍M1A1 HC) によって\t撃破されました IT-1",
+        "=CLAN= TestPilot (◍M1A1 HC) destroyed IT-1",
+    ],
+)
+def test_captured_8111_kill_message_formats(message):
+    """真实 8111 格式中的军团标签、特殊符号和隐藏字符不影响识别。"""
+    reader = QueuedReader([
+        (True, []),
+        (True, [{"id": 1, "msg": message}]),
+    ])
+    detector = EventDetector(reader)
+    aircraft, tank = make_configs()
+    aircraft.player_name = "TestPilot"
+    tank.player_name = "TestPilot"
+
+    detector.poll(GameState(), "tank", aircraft, tank)
+    event = detector.poll(active_state(), "tank", aircraft, tank)
+
+    assert event["kind"] == "kill"
+
+
 def test_duplicate_id_does_not_trigger_twice():
     """接口重复返回同一 ID 时只触发一次。"""
     record = {"id": 2, "msg": "玩家击毁了敌人"}
