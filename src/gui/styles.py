@@ -215,7 +215,7 @@ QPushButton#secondaryButton, QPushButton#overlayContentButton {{
     border: 1px solid {COLORS['border']};
 }}
 QPushButton#secondaryButton:hover, QPushButton#overlayContentButton:hover {{ background: {COLORS['bg_soft']}; }}
-QPushButton#textButton, QPushButton#aboutButton {{
+QPushButton#textButton, QPushButton#aboutButton, QPushButton#runtimeLogButton {{
     background: transparent;
     color: {COLORS['primary']};
     border: 0;
@@ -354,6 +354,29 @@ QDialog#overlayContentDialog {{
 }}
 QDialog#aboutDialog {{
     background: {COLORS['bg_panel']};
+}}
+QDialog#runtimeLogDialog {{
+    background: {COLORS['bg_main']};
+    color: {COLORS['text_primary']};
+    font-family: {FONTS['default']};
+    font-size: 13px;
+}}
+QPlainTextEdit#runtimeLogViewer {{
+    background: {COLORS['bg_panel']};
+    color: {COLORS['text_primary']};
+    border: 1px solid {COLORS['border']};
+    border-radius: 6px;
+    padding: 8px;
+    font-family: Consolas, Microsoft YaHei;
+    font-size: 12px;
+    selection-background-color: {COLORS['primary']};
+    selection-color: white;
+}}
+QLabel#runtimeLogLocation, QLabel#runtimeLogHint {{
+    color: {COLORS['text_secondary']};
+}}
+QLabel#runtimeLogStorageStatus {{
+    color: {COLORS['error']};
 }}
 QLabel#aboutTitle {{
     color: {COLORS['text_primary']};

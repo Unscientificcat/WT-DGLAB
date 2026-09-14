@@ -35,7 +35,7 @@ class FakeSession:
         self.responses = responses
         self.calls = []
 
-    def get(self, url, timeout):
+    def get(self, url, timeout, **kwargs):
         """模拟 requests.Session.get。"""
         self.calls.append(url)
         return self.responses[url]
@@ -76,7 +76,7 @@ def test_unreachable_game_reports_link_down():
     """战争雷霆未运行（连接拒绝）时 link_ok 为 False。"""
 
     class RaisingSession:
-        def get(self, url, timeout):
+        def get(self, url, timeout, **kwargs):
             raise requests.ConnectionError("connection refused")
 
     reader = GameReader()
@@ -86,6 +86,60 @@ def test_unreachable_game_reports_link_down():
 
     assert not state.link_ok
     assert not state.connected
+
+
+def test_session_ignores_system_proxy():
+    """8111 回环请求必须绕过系统代理与代理环境变量。
+
+    加速器/Clash 设置系统代理后若未放行 127.0.0.1，浏览器因内置绕行
+    仍可打开 8111，但走代理的 requests 会全部失败——状态灯误报未连接。
+    """
+    reader = GameReader()
+
+    assert reader._session.trust_env is False
+    assert reader._session.proxies == {"http": None, "https": None}
+
+
+def test_link_failure_reason_logged_once_per_cause():
+    """8111 失败原因按防抖记录：同一原因只写一次，恢复后允许再次记录。"""
+
+    class FlakySession:
+        def __init__(self):
+            self.fail = True
+
+        def get(self, url, timeout, **kwargs):
+            if self.fail:
+                raise requests.ConnectionError("connection refused")
+            return FakeResponse({"valid": False})
+
+    reader = GameReader()
+    session = FlakySession()
+    reader._session = session
+
+    reader.fetch()
+    reader.fetch()
+    assert reader._last_link_error == (
+        "ConnectionError: connection refused")
+
+    session.fail = False
+    reader.fetch()
+    assert reader._last_link_error == ""
+
+    session.fail = True
+    reader.fetch()
+    assert reader._last_link_error != ""
+
+
+def test_http_error_status_logged():
+    """8111 被其他程序占用（返回非 200）时也计入失败原因。"""
+    reader = make_reader({
+        GameReader.STATE_URL: FakeResponse({}, status_code=404),
+    })
+
+    state = reader.fetch()
+
+    assert not state.link_ok
+    assert "404" in reader._last_link_error
 
 
 def test_main_menu_shows_connected_but_zeroes_output():

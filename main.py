@@ -1,4 +1,4 @@
-"""郊狼雷霆 v1.0 — 战争雷霆 × 郊狼 3.0 电击联动
+"""郊狼雷霆 v1.1 — 战争雷霆 × 郊狼 3.0 电击联动
 
 启动方式：
     python main.py
@@ -36,12 +36,12 @@ from src.gui.overlay import OverlayWindow, OVERLAY_CONTENT_FLAGS
 from src.gui.waveform_scope import ChannelScopeDialog
 from src.runtime_paths import application_directory, resource_path
 from src.single_instance import SingleInstance
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    datefmt="%H:%M:%S",
+from src.runtime_logging import (
+    start_session, mark_runtime_abnormal, StrengthLogSummary,
 )
+from src.version import APP_VERSION
+from src.connection_diagnostics import ConnectionDiagnostics
+
 logger = logging.getLogger("WT-DGLAB")
 
 
@@ -77,6 +77,12 @@ class App:
     """应用主控制器 — 后台线程读取游戏数据，主线程只负责更新 GUI"""
 
     def __init__(self):
+        self._shutdown_complete = False
+        self._shutdown_started = False
+        self._stop_event = threading.Event()
+        self._start_workers = []
+        self._controllers = []
+        self._strength_summary = StrengthLogSummary()
         # ===== 配置 =====
         self.config_mgr = _load_config_manager()
         self.waveform_catalog = WaveformCatalog()
@@ -134,11 +140,13 @@ class App:
 
         # ===== 游戏数据读取器 =====
         self.game_reader = GameReader()
+        self._connection_diagnostics = ConnectionDiagnostics()
         self.event_detector = EventDetector(self.game_reader)
 
         # ===== 郊狼控制器 =====
         self._coyote_protocol = self._cfg.app.dglab_protocol
         self.coyote = self._create_coyote_controller()
+        self._controllers.append(self.coyote)
 
         # ===== 线程间通信 =====
         self._data_queue = queue.Queue(maxsize=2)  # 只保留最新游戏数据
@@ -164,6 +172,7 @@ class App:
         # 首次启动显示注意事项
         if not self._cfg.app.notice_accepted:
             if not self._show_disclaimer_dialog():
+                self._on_close()
                 return  # 用户关闭对话框则退出
             self._cfg.app.notice_accepted = True
             self.config_mgr.save()
@@ -188,13 +197,50 @@ class App:
 
     def _on_close(self):
         """托盘退出回调 — 保存配置并清理后台资源。"""
-        self.window.save_current_settings()
-        self.config_mgr.save()
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
         self._running = False
-        self.coyote.stop()
+        self._stop_event.set()
+        clean = True
+        logger.info("正在退出程序并清理后台资源")
+
+        def cleanup(action, label):
+            nonlocal clean
+            try:
+                action()
+            except Exception:
+                clean = False
+                logger.exception("退出清理失败：%s", label)
+
+        cleanup(self.window.save_current_settings, "保存界面设置")
+        cleanup(self.config_mgr.save, "保存配置")
+        # 优先归零当前设备，单项清理失败不能阻止其他资源停止。
+        cleanup(self.coyote.stop, "停止当前控制器")
+        diagnostics = getattr(self, "_connection_diagnostics", None)
+        if diagnostics is not None and not diagnostics.stop():
+            clean = False
+            logger.warning("后台连接诊断尚未结束，保留本次日志")
+        cleanup(self.window.stop_runtime_log_view, "关闭日志窗口")
+        workers = list(self._start_workers)
+        poller = getattr(self, "_poller_thread", None)
+        if poller is not None:
+            workers.append(poller)
+        for worker in workers:
+            cleanup(lambda worker=worker: worker.join(timeout=13), "等待后台线程")
+            if worker.is_alive():
+                clean = False
+                logger.error("后台线程未能结束：%s", worker.name)
+        # 启动线程可能在第一次停止后才创建控制循环，等待后再次清理。
+        for controller in self._controllers:
+            cleanup(controller.stop, "停止控制器")
+        cleanup(self._strength_summary.flush, "记录最后强度变化")
         for dialog in self._scope_dialogs.values():
-            dialog.close()
-        self.overlay.destroy()
+            cleanup(dialog.close, "关闭波形窗口")
+        cleanup(self.overlay.destroy, "关闭悬浮窗")
+        if not clean:
+            mark_runtime_abnormal("退出清理未完成")
+        self._shutdown_complete = clean
         self.window.quit()
 
     def _show_disclaimer_dialog(self) -> bool:
@@ -213,8 +259,15 @@ class App:
         while self._running:
             try:
                 state = self.game_reader.fetch()
-            except Exception:
+                self._last_poll_error = ""
+            except Exception as error:
+                reason = f"{type(error).__name__}: {error}"
+                if reason != getattr(self, "_last_poll_error", ""):
+                    logger.exception("读取游戏数据异常：%s", reason)
+                self._last_poll_error = reason
                 state = GameState()
+
+            self._connection_diagnostics.observe(state.link_ok)
 
             # 游戏数据入队
             try:
@@ -229,8 +282,7 @@ class App:
             self._poll_events(state)
 
             # 等待下一次轮询
-            self._running_event = threading.Event()
-            self._running_event.wait(
+            self._stop_event.wait(
                 max(self._cfg.app.refresh_interval_ms / 1000.0, 0.05)
             )
 
@@ -345,11 +397,13 @@ class App:
             self._wt_fail_count = 0
             if not self._wt_connected:
                 self._wt_connected = True
+                logger.info("战争雷霆 8111 已连接/恢复")
                 self.window.status_bar.set_wt_status(True)
         else:
             self._wt_fail_count += 1
             if self._wt_fail_count >= 3 and self._wt_connected:
                 self._wt_connected = False
+                logger.warning("战争雷霆 8111 已断开")
                 self.window.status_bar.set_wt_status(False)
 
         # 未确认仍在有效对局时，所有可能残留的 8111 指标都不可信。
@@ -604,6 +658,7 @@ class App:
         self._coyote_started = False
         self._coyote_starting = False
         self.coyote = self._create_coyote_controller()
+        self._controllers.append(self.coyote)
         self.window.qr_widget.clear_qr_image()
         self.window.after(200, self._start_coyote)
 
@@ -784,6 +839,8 @@ class App:
 
     def _start_coyote(self):
         """启动当前协议控制器并生成对应 App 配对二维码。"""
+        if not self._running:
+            return
         if self._coyote_started or self._coyote_starting:
             return
 
@@ -795,7 +852,11 @@ class App:
             target=self._start_coyote_worker,
             args=(controller, label),
             daemon=True,
+            name="郊狼连接启动",
         )
+        self._start_workers = [worker for worker in self._start_workers
+                               if worker.is_alive()]
+        self._start_workers.append(thread)
         thread.start()
 
     def _start_coyote_worker(self, controller, label: str) -> None:
@@ -863,30 +924,60 @@ class App:
     def _send_strength(self, value_a: int, value_b: int):
         """向郊狼发送双通道强度"""
         status = self.coyote.status
+        if not hasattr(self, "_strength_summary"):
+            self._strength_summary = StrengthLogSummary()
+        self._strength_summary.observe(value_a, value_b)
+        reason = ""
         if value_a > 0 or value_b > 0:
             if not status.bound:
-                logger.warning(f"强度 A={value_a} B={value_b} 但郊狼未绑定! 请手机扫码连接")
+                reason = "目标强度非零，但郊狼未绑定，请手机扫码连接"
             elif not status.server_running:
-                logger.warning(f"强度 A={value_a} B={value_b} 但服务端未运行!")
-            else:
-                logger.info(f"发送强度: A={value_a} B={value_b}")
+                reason = "目标强度非零，但服务端未运行"
+        if reason and reason != getattr(self, "_last_strength_warning", ""):
+            logger.warning(reason)
+        self._last_strength_warning = reason
         self.coyote.set_strength_a(value_a)
         self.coyote.set_strength_b(value_b)
 
 
 def main():
-    # QApplication 先于单实例服务创建，保证本地 IPC 可以安全监听。
-    qt_app = QApplication.instance() or QApplication(sys.argv)
-    instance = SingleInstance()
-    if not instance.acquire():
-        return
-
-    app = App()
-    instance.set_activate_callback(app.window.restore_from_tray)
+    """启动独立日志会话，只有明确完成正常退出时才删除自动文件。"""
+    session = start_session()
+    instance = None
+    app = None
+    normal = False
     try:
+        logger.info("郊狼雷霆 %s 启动；日志：%s", APP_VERSION, session.path)
+        # QApplication 先于单实例服务创建，保证本地 IPC 可以安全监听。
+        qt_app = QApplication.instance() or QApplication(sys.argv)
+        instance = SingleInstance()
+        if not instance.acquire():
+            logger.info("已有实例运行，已请求唤起主窗口")
+            normal = True
+            return
+        app = App()
+        instance.set_activate_callback(app.window.restore_from_tray)
         app.run()
+        normal = app._shutdown_complete
+    except BaseException:
+        session.abnormal = True
+        logger.critical("程序入口异常", exc_info=True)
+        raise
     finally:
-        instance.close()
+        if app is not None and not app._shutdown_started:
+            # 非预期主循环退出也清理设备，但不追认成正常退出。
+            try:
+                app._on_close()
+            except Exception:
+                session.abnormal = True
+                logger.exception("异常退出清理失败")
+        try:
+            if instance is not None:
+                instance.close()
+        except Exception:
+            normal = False
+            logger.exception("单实例资源清理失败")
+        session.finish(normal=normal)
 
 
 if __name__ == "__main__":

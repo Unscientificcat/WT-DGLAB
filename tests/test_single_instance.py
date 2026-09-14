@@ -37,14 +37,21 @@ def test_activation_message_waits_for_callback():
     socket.write.assert_called_once_with(b"ok")
 
 
-def test_main_does_not_create_app_for_second_instance(monkeypatch):
+def test_main_does_not_create_app_for_second_instance(monkeypatch, tmp_path):
     """重复启动时主入口不得初始化第二套业务控制器。"""
     instance = Mock()
     instance.acquire.return_value = False
     app_class = Mock()
     monkeypatch.setattr(main, "SingleInstance", lambda: instance)
     monkeypatch.setattr(main, "App", app_class)
+    from src.runtime_logging import RuntimeLogSession
+    session = RuntimeLogSession(tmp_path, install_hooks=False)
+    history = tmp_path / "run_other_process.log"
+    history.write_text("其他实例", encoding="utf-8")
+    monkeypatch.setattr(main, "start_session", lambda: session)
 
     main.main()
 
     app_class.assert_not_called()
+    assert not session.path.exists()
+    assert history.exists()

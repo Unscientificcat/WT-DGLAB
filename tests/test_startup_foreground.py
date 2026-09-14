@@ -52,6 +52,7 @@ def test_app_shows_main_window_before_first_disclaimer():
     app._show_disclaimer_dialog = Mock(
         side_effect=lambda: call_order.append("dialog") or False
     )
+    app._on_close = Mock()
 
     app.run()
 

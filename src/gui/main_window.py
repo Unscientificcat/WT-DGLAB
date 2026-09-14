@@ -42,6 +42,8 @@ from PySide6.QtWidgets import (
 
 from .disclaimer_dialog import show_disclaimer_dialog
 from .about_dialog import show_about_dialog
+from .runtime_log_dialog import RuntimeLogDialog
+from ..runtime_logging import current_session
 from .glass import BackgroundCatalog, BackdropCanvas, GlassCard
 from .styles import COLORS, setup_styles
 from ..version import APP_NAME, APP_VERSION
@@ -187,6 +189,12 @@ class StatusBar(GlassCard):
         self.address_label.setObjectName("addressText")
         self.address_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
+        self.runtime_log_button = QPushButton("运行日志")
+        self.runtime_log_button.setObjectName("runtimeLogButton")
+        self.runtime_log_button.clicked.connect(
+            lambda: self.window().show_runtime_log()
+        )
+
         self.disclaimer_button = QPushButton("注意事项")
         self.disclaimer_button.setObjectName("textButton")
         self.disclaimer_button.clicked.connect(
@@ -205,6 +213,7 @@ class StatusBar(GlassCard):
         layout.addWidget(self.wt_pill)
         layout.addWidget(self.dg_pill)
         layout.addWidget(self.address_label, 1)
+        layout.addWidget(self.runtime_log_button)
         layout.addWidget(self.disclaimer_button)
         layout.addWidget(self.about_button)
 
@@ -1753,6 +1762,20 @@ class MainWindow(QMainWindow):
         if handle is not None:
             handle.requestActivate()
 
+    def show_runtime_log(self) -> None:
+        """显示本次运行日志，重复点击只唤起已有窗口。"""
+        if getattr(self, "_runtime_log_dialog", None) is None:
+            self._runtime_log_dialog = RuntimeLogDialog(current_session(), self)
+        self._runtime_log_dialog.show()
+        self._runtime_log_dialog.raise_()
+        self._runtime_log_dialog.activateWindow()
+
+    def stop_runtime_log_view(self) -> None:
+        """真正退出前停止日志窗口，等待当前导出释放文件。"""
+        dialog = getattr(self, "_runtime_log_dialog", None)
+        if dialog is not None:
+            dialog.shutdown()
+
     def save_current_settings(self) -> bool:
         """静默保存界面当前设置，自动保存时保留无效 Relay 旧值。"""
         return self.settings_panel.save_settings(
@@ -1766,12 +1789,12 @@ class MainWindow(QMainWindow):
         if self._exit_requested:
             return
         self._exit_requested = True
-        self.save_current_settings()
         self.tray_icon.hide()
         if self._close_callback:
             callback = self._close_callback
             QTimer.singleShot(0, callback)
         else:
+            self.save_current_settings()
             self.quit()
 
     def _on_settings_saved(self) -> None:

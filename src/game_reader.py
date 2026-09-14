@@ -10,12 +10,17 @@
     /hudmsg — HUD 消息日志（击杀、损伤事件等）
 """
 
-import json
+import logging
 import math
+import re
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 import requests
+
+logger = logging.getLogger("GameReader")
 
 
 # ============================================================
@@ -84,7 +89,92 @@ class GameReader:
     TIMEOUT = 0.5  # 请求超时（秒），127.0.0.1 通常 <10ms
 
     def __init__(self):
+        # trust_env=False：8111 是本机回环服务，绝不能走系统代理或
+        # HTTP_PROXY 环境变量（加速器/Clash 设置系统代理后未放行 127.0.0.1
+        # 会导致全部请求失败，而浏览器自带回环绕行不受影响）。
         self._session = requests.Session()
+        self._session.trust_env = False
+        self._session.proxies = {"http": None, "https": None}
+        self._last_link_error: str = ""
+        self._endpoint_states = {}
+        self._hud_local = threading.local()
+        self._last_mission_state = None
+
+    def _report_endpoint(self, url, key, message, *, failed=False) -> None:
+        """按接口和原因去重，耗时变化本身不触发重复日志。"""
+        previous = self._endpoint_states.get(url)
+        if previous == key:
+            return
+        self._endpoint_states[url] = key
+        prefix = "接口异常" if failed else "接口正常/恢复"
+        (logger.warning if failed else logger.info)(
+            "%s：%s；%s", prefix, url, message)
+
+    def _fetch_json(self, session, url, *, params=None):
+        """记录请求证据，拒绝重定向及非对象 JSON，不输出完整遥测正文。"""
+        started = time.monotonic()
+        options = {"timeout": self.TIMEOUT, "allow_redirects": False}
+        if params is not None:
+            options["params"] = params
+        response = None
+        try:
+            response = session.get(url, **options)
+            elapsed = (time.monotonic() - started) * 1000
+            content_type = getattr(response, "headers", {}).get("Content-Type", "未提供")
+            evidence = (f"HTTP {response.status_code}；耗时={elapsed:.0f}ms；"
+                        f"超时阈值={self.TIMEOUT}s；Content-Type={content_type}")
+            if response.status_code != 200:
+                reason = f"HTTP {response.status_code}"
+                hint = "接口返回非成功状态，检查接口路径、拦截或端口占用"
+                if 300 <= response.status_code < 400:
+                    hint = "出现重定向，已拒绝跟随；本机遥测接口通常不需要重定向"
+                self._report_endpoint(url, reason, evidence + "；" + hint, failed=True)
+                if url == self.STATE_URL:
+                    self._log_link_error(reason)
+                return None
+            try:
+                data = response.json()
+            except ValueError as error:
+                reason = f"JSON 解析失败：{type(error).__name__}"
+                self._report_endpoint(
+                    url, "invalid_json", evidence + "；" + reason
+                    + "；可能返回了 HTML/拦截页或截断响应", failed=True)
+                if url == self.STATE_URL:
+                    self._log_link_error(reason)
+                return None
+            if not isinstance(data, dict):
+                reason = f"JSON 顶层类型={type(data).__name__}，预期为对象"
+                self._report_endpoint(url, reason, evidence + "；" + reason, failed=True)
+                if url == self.STATE_URL:
+                    self._log_link_error(reason)
+                return None
+            slow = elapsed >= self.TIMEOUT * 800
+            self._report_endpoint(
+                url, "slow" if slow else "ok", evidence
+                + ("；接近超时阈值，游戏负载可能导致间歇超时" if slow else "；JSON 对象解析成功"))
+            return data
+        except requests.RequestException as error:
+            elapsed = (time.monotonic() - started) * 1000
+            reason = re.sub(r"0x[0-9a-fA-F]+", "0x…", f"{type(error).__name__}: {error}")
+            if isinstance(error, requests.ConnectTimeout):
+                hint = "建立连接超时，检查监听服务或按进程拦截"
+            elif isinstance(error, requests.ReadTimeout):
+                hint = "响应读取超时，服务可能繁忙；后台诊断会比较更长超时"
+            elif isinstance(error, requests.exceptions.ProxyError):
+                hint = "发生代理错误，检查实际运行版本与代理策略"
+            elif isinstance(error, requests.Timeout):
+                hint = "请求超时，检查游戏负载和接口响应"
+            else:
+                hint = "检查服务未监听、连接被拒绝/重置或安全软件拦截；仅凭此错误无法确定防火墙原因"
+            self._report_endpoint(
+                url, reason, f"{reason}；耗时={elapsed:.0f}ms；"
+                f"超时阈值={self.TIMEOUT}s；{hint}", failed=True)
+            if url == self.STATE_URL:
+                self._log_link_error(f"{type(error).__name__}: {error}")
+            return None
+        finally:
+            if response is not None and callable(getattr(response, "close", None)):
+                response.close()
 
     def fetch_hudmsg(self, last_dmg_id: int = 0) -> list:
         """获取增量 hudmsg 损伤记录（线程安全，使用独立请求）
@@ -100,19 +190,24 @@ class GameReader:
 
     def fetch_hudmsg_with_status(self, last_dmg_id: int = 0) -> tuple[bool, list]:
         """获取增量 HUD 记录，并区分空结果与请求失败。"""
-        try:
-            resp = requests.get(
-                self.HUDMSG_URL,
-                params={"lastEvt": 0, "lastDmg": last_dmg_id},
-                timeout=self.TIMEOUT,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                records = data.get("damage", [])
-                return True, records if isinstance(records, list) else []
-        except Exception:
-            pass
-        return False, []
+        if not hasattr(self._hud_local, "session"):
+            session = requests.Session()
+            session.trust_env = False
+            session.proxies = {"http": None, "https": None}
+            self._hud_local.session = session
+        data = self._fetch_json(
+            self._hud_local.session, self.HUDMSG_URL,
+            params={"lastEvt": 0, "lastDmg": last_dmg_id})
+        if data is None:
+            return False, []
+        records = data.get("damage", [])
+        if not isinstance(records, list):
+            self._report_endpoint(self.HUDMSG_URL + "#damage", "invalid_damage",
+                                  "damage 字段不是列表，无法读取事件", failed=True)
+            return False, []
+        if self.HUDMSG_URL + "#damage" in self._endpoint_states:
+            self._report_endpoint(self.HUDMSG_URL + "#damage", "ok", "damage 列表已恢复")
+        return True, records
 
     def fetch(self) -> GameState:
         """获取一次游戏数据，返回 GameState
@@ -121,43 +216,37 @@ class GameReader:
         """
         state = GameState()
 
-        try:
-            resp = self._session.get(self.STATE_URL, timeout=self.TIMEOUT)
-            if resp.status_code != 200:
-                return state
-            state.raw_state = resp.json()
-        except (requests.ConnectionError, requests.Timeout,
-                requests.RequestException, json.JSONDecodeError):
+        data = self._fetch_json(self._session, self.STATE_URL)
+        if data is None:
             return state
+        state.raw_state = data
 
         # /state 可达即代表战争雷霆遥测服务在线（主菜单同样为 True），
         # 仅用于状态栏连接显示；对局判定仍以 map_info 为准。
         state.link_ok = True
+        self._last_link_error = ""
 
         # /indicators 会在退出对局后保留最后一帧数据，不能单独用于驱动设备。
         # /map_info.json 在未处于对局时返回 {"valid": false}；有效对局则
         # 返回 valid=true 或完整地图元数据。读取失败时按无效处理，优先保证归零。
-        try:
-            map_resp = self._session.get(self.MAP_INFO_URL,
-                                         timeout=self.TIMEOUT)
-            if map_resp.status_code == 200:
-                state.raw_map_info = map_resp.json()
-        except (requests.RequestException, json.JSONDecodeError):
-            pass
-
-        if not self._is_active_mission(state.raw_map_info):
+        map_data = self._fetch_json(self._session, self.MAP_INFO_URL)
+        state.raw_map_info = map_data or {}
+        active = self._is_active_mission(state.raw_map_info)
+        mission_state = (active, "地图接口失败" if map_data is None else
+                         "valid=false" if map_data.get("valid") is False else
+                         "已确认有效对局" if active else "缺少有效对局标记/地图字段")
+        if mission_state != self._last_mission_state:
+            self._last_mission_state = mission_state
+            logger.info("连接判定：/state 正常，link_ok=True；对局有效=%s；%s；"
+                        "机库/主菜单可显示已连接，无有效对局时仍保持零输出",
+                        active, mission_state[1])
+        if not active:
             return state
 
         state.connected = True
 
         # 同时获取 indicators（陆战中 state 可能为 {"valid": false}，但 indicators 有数据）
-        try:
-            ind_resp = self._session.get(self.INDICATORS_URL,
-                                         timeout=self.TIMEOUT)
-            if ind_resp.status_code == 200:
-                state.raw_indicators = ind_resp.json()
-        except Exception:
-            pass
+        state.raw_indicators = self._fetch_json(self._session, self.INDICATORS_URL) or {}
 
         # 解析载具类型（综合 state + indicators）
         vehicle_type = self._detect_vehicle_type(state.raw_state,
@@ -170,6 +259,19 @@ class GameReader:
             state.tank = self._parse_tank(state.raw_state, state.raw_indicators)
 
         return state
+
+    def _log_link_error(self, message: str) -> None:
+        """记录 8111 不可达原因；同一原因只记录一次，恢复后允许再次记录。
+
+        未开游戏时轮询每 200ms 失败一次，直接逐条写会刷爆日志，
+        因此仅在原因变化时输出。
+        """
+        # requests 异常包含每次新建连接对象的地址，不把地址变化当成新故障。
+        message = re.sub(r"0x[0-9a-fA-F]+", "0x…", message)
+        if message == self._last_link_error:
+            return
+        self._last_link_error = message
+        logger.warning(f"战争雷霆 8111 不可达: {message}")
 
     @staticmethod
     def _is_active_mission(map_info_json: dict) -> bool:

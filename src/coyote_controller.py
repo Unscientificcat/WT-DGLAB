@@ -15,6 +15,7 @@
 
 import asyncio
 import logging
+from .runtime_logging import mark_runtime_abnormal
 import queue
 import random
 import socket
@@ -140,13 +141,16 @@ class CoyoteController:
                 try:
                     future.result(timeout=3)
                 except Exception as error:
-                    logger.warning(f"V3 停止清理未完成: {error}")
+                    logger.warning(f"V3 停止清理未完成: {error}", exc_info=True)
+                    mark_runtime_abnormal("V3 停止清理未完成")
         else:
             self._running = False
             self._waveform_configs.clear()
         if (wait and self._thread and self._thread.is_alive()
                 and threading.current_thread() is not self._thread):
             self._thread.join(timeout=3)
+            if self._thread.is_alive():
+                mark_runtime_abnormal("V3 控制线程未能停止")
 
     def get_qrcode_url(self, ip: str = "") -> str:
         """获取二维码 URL（由 PyDGLab-WS 客户端生成，非简单 ws:// 地址）
@@ -226,7 +230,8 @@ class CoyoteController:
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.error(f"后台线程异常: {e}")
+            logger.error(f"后台线程异常: {e}", exc_info=True)
+            mark_runtime_abnormal("V3 控制线程异常退出")
             self._status.error = str(e)
         finally:
             pending = asyncio.all_tasks(loop)
@@ -259,7 +264,8 @@ class CoyoteController:
                 await self._exec_command(("strength", "A", 0))
                 await self._exec_command(("strength", "B", 0))
             except Exception as error:
-                logger.warning(f"V3 通道归零失败: {error}")
+                logger.warning(f"V3 通道归零失败: {error}", exc_info=True)
+                mark_runtime_abnormal("V3 退出通道归零失败")
         self._cancel_main_task()
 
     async def _async_main(self):
@@ -298,7 +304,7 @@ class CoyoteController:
                     try:
                         ret = await self._client.bind()
                     except Exception as e:
-                        logger.warning(f"绑定异常: {e}")
+                        logger.warning(f"绑定异常: {e}", exc_info=True)
                         await asyncio.sleep(2)
                         continue
 
@@ -353,7 +359,7 @@ class CoyoteController:
             self._result_queue.put(False)
         except Exception as e:
             self._status.error = str(e)
-            logger.error(f"服务端启动失败: {e}")
+            logger.error(f"服务端启动失败: {e}", exc_info=True)
             try:
                 self._result_queue.put(False)
             except Exception:
@@ -375,7 +381,7 @@ class CoyoteController:
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.warning(f"事件监听异常: {e}")
+            logger.warning(f"事件监听异常: {e}", exc_info=True)
             stop_event.set()
 
     async def _cmd_processor(self, stop_event: asyncio.Event):
@@ -398,7 +404,7 @@ class CoyoteController:
                     stop_event.set()
                     return
                 else:
-                    logger.error(f"指令失败: {cmd[0] if cmd else '?'}: {err_msg}")
+                    logger.error(f"指令失败: {cmd[0] if cmd else '?'}: {err_msg}", exc_info=True)
 
     async def _exec_command(self, cmd: tuple):
         """执行单条命令"""

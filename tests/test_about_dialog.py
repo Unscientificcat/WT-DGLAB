@@ -52,7 +52,7 @@ def test_about_dialog_version_matches_single_source():
     dialog = AboutDialog()
 
     assert dialog.version_label.text() == f"版本 {APP_VERSION}"
-    assert APP_VERSION == "v1.0"
+    assert APP_VERSION == "v1.1"
     assert VERSION == APP_VERSION
     dialog.close()
 
@@ -63,7 +63,7 @@ def test_main_window_title_uses_version_constant(tmp_path):
     window = MainWindow(manager)
 
     assert window.windowTitle() == f"{APP_NAME} {APP_VERSION}"
-    assert window.windowTitle() == "郊狼雷霆 v1.0"
+    assert window.windowTitle() == "郊狼雷霆 v1.1"
     window.close()
 
 

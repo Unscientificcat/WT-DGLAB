@@ -35,7 +35,7 @@ def test_frozen_resource_path_uses_exe_directory(tmp_path, monkeypatch):
 
 def test_validate_package_accepts_minimal_layout(tmp_path):
     """发布内容检查接受目标目录结构。"""
-    package = tmp_path / "WT-DGLAB v1.0"
+    package = tmp_path / "WT-DGLAB v1.1"
     (package / "_internal").mkdir(parents=True)
     (package / "resources").mkdir()
     for relative in (

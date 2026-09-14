@@ -32,7 +32,7 @@ def test_tubiao1_outputs_are_used_for_window_and_brand_icons(tmp_path):
     manager = ConfigManager(str(tmp_path / "config.json"))
     window = MainWindow(manager)
 
-    assert window.windowTitle() == "郊狼雷霆 v1.0"
+    assert window.windowTitle() == "郊狼雷霆 v1.1"
     assert os.path.basename(_resource_path("tubiao_ui.jpg")) == "tubiao_ui.jpg"
     assert os.path.basename(_resource_path("tubiao.ico")) == "tubiao.ico"
     assert not window.windowIcon().isNull()

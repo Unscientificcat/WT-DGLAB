@@ -1,6 +1,7 @@
 """配置管理模块 — 读写 JSON 配置文件，管理所有用户设置"""
 
 import json
+import logging
 import math
 import os
 from dataclasses import dataclass, field, asdict
@@ -161,6 +162,7 @@ class ConfigManager:
     def __init__(self, config_path: str = "config.json"):
         self._config_path = config_path
         self._config: Config = Config()
+        self._last_logged_config = self._to_dict()
 
     @property
     def config(self) -> Config:
@@ -182,8 +184,11 @@ class ConfigManager:
                 self._apply_dict(data)
             except (json.JSONDecodeError, KeyError, TypeError, ValueError,
                     AttributeError, OverflowError):
+                logging.getLogger("ConfigManager").warning(
+                    "配置文件无效，使用默认值", exc_info=True)
                 # 配置文件损坏时使用默认值
                 self._config = Config()
+        self._last_logged_config = self._to_dict()
         return self._config
 
     def load_template(self, template_path: str) -> Config:
@@ -191,6 +196,7 @@ class ConfigManager:
         template_manager = ConfigManager(template_path)
         template_manager.load()
         self._config = template_manager.config
+        self._last_logged_config = self._to_dict()
         return self._config
 
     def save(self) -> None:
@@ -210,6 +216,7 @@ class ConfigManager:
                 file.flush()
                 os.fsync(file.fileno())
             os.replace(temp_path, config_path)
+            self._log_changes()
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
@@ -218,6 +225,27 @@ class ConfigManager:
         """恢复所有默认值"""
         self._config = Config()
         return self._config
+
+    def _log_changes(self) -> None:
+        """成功保存后记录关键配置差异，避免自动保存重复刷屏。"""
+        current = self._to_dict()
+        changes = []
+        for section, values in current.items():
+            if section not in {"aircraft", "tank", "cas", "events", "tank_events", "app"}:
+                continue
+            for key, value in values.items():
+                if section == "app" and key not in {
+                    "mode", "dglab_protocol", "ws_port", "v4_relay_url",
+                    "refresh_interval_ms",
+                }:
+                    continue
+                old = self._last_logged_config.get(section, {}).get(key)
+                if old != value:
+                    changes.append(f"{section}.{key}: {old} → {value}")
+        if changes:
+            logging.getLogger("ConfigManager").info(
+                "关键设置已保存：%s", "；".join(changes))
+        self._last_logged_config = current
 
     def _to_dict(self) -> dict:
         return {

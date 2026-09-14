@@ -177,6 +177,7 @@ def test_app_switches_controller_after_protocol_setting_is_saved():
     old_controller.clear_all = Mock()
     old_controller.stop = Mock()
     app.coyote = old_controller
+    app._controllers = [old_controller]
     replacement = Mock()
     app._create_coyote_controller = Mock(return_value=replacement)
     app.window = SimpleNamespace(

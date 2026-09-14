@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+from .runtime_logging import mark_runtime_abnormal
 import queue
 import random
 import threading
@@ -97,12 +98,15 @@ class CoyoteV4Controller:
                 try:
                     future.result(timeout=3)
                 except Exception as error:
-                    logger.warning(f"V4 停止清理未完成: {error}")
+                    logger.warning(f"V4 停止清理未完成: {error}", exc_info=True)
+                    mark_runtime_abnormal("V4 停止清理未完成")
         else:
             self._running = False
         if (wait and self._thread and self._thread.is_alive()
                 and threading.current_thread() is not self._thread):
             self._thread.join(timeout=3)
+            if self._thread.is_alive():
+                mark_runtime_abnormal("V4 控制线程未能停止")
 
     def get_qrcode_url(self, ip: str = "") -> str:
         """返回 DG-LAB 4 App 可识别的官方配对链接。"""
@@ -193,7 +197,8 @@ class CoyoteV4Controller:
             loop.run_until_complete(self._async_main())
         except Exception as error:
             self._status.error = str(error)
-            logger.error(f"V4 控制线程异常: {error}")
+            logger.error(f"V4 控制线程异常: {error}", exc_info=True)
+            mark_runtime_abnormal("V4 控制线程异常退出")
             self._notify_start_result(False)
         finally:
             pending = asyncio.all_tasks(loop)
@@ -249,7 +254,7 @@ class CoyoteV4Controller:
         except Exception as error:
             self._status.error = str(error)
             self._notify_start_result(False)
-            logger.error(f"V4 Relay 连接失败: {error}")
+            logger.error(f"V4 Relay 连接失败: {error}", exc_info=True)
         finally:
             self._websocket = None
             self._set_disconnected()
@@ -369,7 +374,7 @@ class CoyoteV4Controller:
                 await self._execute_command(command)
             except Exception as error:
                 self._status.error = str(error)
-                logger.warning(f"V4 指令失败: {error}")
+                logger.warning(f"V4 指令失败: {error}", exc_info=True)
 
     async def _execute_command(self, command: tuple) -> None:
         """执行单条强度或波形命令。"""
@@ -509,7 +514,8 @@ class CoyoteV4Controller:
             if self._websocket is not None:
                 await self._websocket.close()
         except Exception:
-            pass
+            logger.exception("V4 归零或关闭连接失败")
+            mark_runtime_abnormal("V4 归零或关闭连接失败")
 
     def _detach_device(self, reason: str, keep_client: bool = False) -> None:
         """清除当前 App/设备选择及输出状态。"""
