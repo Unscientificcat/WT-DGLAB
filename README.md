@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-<img src="https://img.shields.io/badge/version-v1.1-4f8fe8" alt="版本 v1.1">
+<img src="https://img.shields.io/badge/version-v1.1.1-4f8fe8" alt="版本 v1.1.1">
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-2d7dd2" alt="Windows 10 / 11">
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776ab" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/DG--LAB%20App-V3%20%2F%20V4-ef6f91" alt="DG-LAB App V3 / V4">
@@ -26,7 +26,7 @@
 
 本项目是一个 Vibe Coding 实践作品，代码、协议判断和安全行为仍应以实际测试结果为准。
 
-当前版本为 `v1.1`。协议、界面和自动化回归已经验证；DG-LAB 4.x App 与实际郊狼设备的完整实机联调仍在进行中，请谨慎测试。
+当前版本为 `v1.1.1`。协议、界面和自动化回归已经验证；DG-LAB 4.x App 与实际郊狼设备的完整实机联调仍在进行中，请谨慎测试。
 
 ## 功能
 
@@ -86,7 +86,7 @@
 
 ### 使用发布版 EXE
 
-1. 从 GitHub Releases 下载 `WT-DGLAB v1.1.zip` 并完整解压。
+1. 从 GitHub Releases 下载 `WT-DGLAB v1.1.1.zip` 并完整解压。
 2. 启动《战争雷霆》，进入机库或对局。
 3. 运行目录中的 `WT-DGLAB.exe`，阅读并确认注意事项。
 4. 在右侧“连接郊狼”区域选择 `V3 App` 或 `V4 App`。
@@ -235,7 +235,7 @@ python -m pytest -q
 python build.py
 ```
 
-打包脚本使用 PyInstaller `--onedir --windowed`，在 `dist/` 生成 `WT-DGLAB v1.1/` 目录及同名 ZIP。目录包含 `WT-DGLAB.exe`、`_internal/`、`resources/`、安全默认模板、README 和 LICENSE。用户配置只保存在 EXE 同目录的 `config.json`；新版本不会自动迁移旧目录配置。
+打包脚本使用 PyInstaller `--onedir --windowed`，在 `dist/` 生成 `WT-DGLAB v1.1.1/` 目录及同名 ZIP。目录包含 `WT-DGLAB.exe`、`_internal/`、`resources/`、安全默认模板、README 和 LICENSE。用户配置只保存在 EXE 同目录的 `config.json`；新版本不会自动迁移旧目录配置。
 
 ## 架构
 
@@ -279,6 +279,13 @@ python build.py
 更详细的技术资料见 [docs/tech-spec.md](docs/tech-spec.md)、[docs/ui-redesign.md](docs/ui-redesign.md) 和 [docs/v4-app-adaptation.md](docs/v4-app-adaptation.md)。
 
 ## 更新日志
+
+### v1.1.1
+
+- 修复陆战维修中被击毁后，死亡惩罚结束再次启动旧维修惩罚的问题。
+- 被击毁后作废旧维修，待后续有效坦克数据明确显示非维修后才允许新的维修触发。
+- 保留击杀结束恢复有效维修；维修失效、关闭或事件到期时及时更新强度及提示。
+- 新增 16 项回归测试，全量自动化测试通过；真实游戏与设备联调仍需单独验证。
 
 ### v1.1
 
@@ -400,7 +407,7 @@ python build.py
 
 - `config.json` 可能包含玩家昵称和个人强度设置，公开仓库前应确认其中没有隐私信息。
 - `wt-dglab-trace.log` 属于诊断日志，不应作为正式发布内容。
-- 建议通过 GitHub Releases 分发 `WT-DGLAB v1.1.zip`，不要要求普通用户从源码构建。
+- 建议通过 GitHub Releases 分发 `WT-DGLAB v1.1.1.zip`，不要要求普通用户从源码构建。
 
 ## 相关资料
 

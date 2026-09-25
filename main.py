@@ -95,11 +95,13 @@ class App:
         self._coyote_started = False
 
         # 事件输出状态
-        self._event_kind = ""       # "" / "kill" / "death"
+        self._event_kind = ""       # "" / "kill" / "death" / "repair"
         self._event_mode = ""       # "aircraft" / "tank"
         self._event_ch_a = 0
         self._event_ch_b = 0
         self._event_remaining = 0.0  # 剩余秒数
+        self._repair_blocked_until_idle = False
+        self._repair_death_state = None
         self._current_mode = self._cfg.app.mode
         self._wt_fail_count = 0
         self._wt_connected = False
@@ -324,20 +326,22 @@ class App:
     def _ui_tick(self):
         """主线程定时器 — 检查数据队列并更新 UI"""
         try:
-            # 1. 取后台检测的事件
+            # 1. 先取最新遥测，死亡事件以本轮状态为基线，不能用它解除限制。
+            state = None
+            try:
+                while True:
+                    state = self._data_queue.get_nowait()
+            except queue.Empty:
+                pass
+            if state is not None:
+                self._last_state = state
+
+            # 2. 取后台检测的事件
             try:
                 while True:
                     event = self._event_queue.get_nowait()
                     if event:
                         self._apply_event(event)
-            except queue.Empty:
-                pass
-
-            # 2. 取最新游戏数据
-            state = None
-            try:
-                while True:
-                    state = self._data_queue.get_nowait()
             except queue.Empty:
                 pass
 
@@ -352,12 +356,10 @@ class App:
             # 4. 事件倒计时
             if self._event_remaining > 0:
                 self._event_remaining -= 0.1
-                # 维修事件：检查是否还在维修中
-                if (self._event_kind == "repair" and self._last_state.tank
-                        and not self._last_state.tank.is_repairing):
-                    self._event_remaining = 0
                 if self._event_remaining <= 0:
                     self._finish_active_event()
+                    # 到期当轮即下发恢复后的强度，不能等下一帧遥测。
+                    self._apply_game_state(self._last_state)
                 elif self._event_kind == "repair":
                     self.window.dashboard.show_event("🔧 维修中")
                 elif self._event_kind == "kill":
@@ -390,6 +392,17 @@ class App:
         self._last_state = state  # 缓存，供模式切换时即时刷新
         mode = self.window.get_mode()
         cfg = self._cfg
+
+        # 死亡当轮及重复使用的缓存不能证明新维修已准备就绪。
+        # 仅后续有效坦克帧明确退出维修后，才允许下一次维修触发。
+        if (getattr(self, "_repair_blocked_until_idle", False)
+                and state is not self._repair_death_state
+                and state.connected and state.vehicle_type == "tank"
+                and state.tank and state.tank.valid
+                and not state.tank.is_repairing):
+            self._repair_blocked_until_idle = False
+            self._repair_death_state = None
+            logger.info("已观察到坦克退出维修，允许新的维修事件")
 
         # 状态灯反映"战争雷霆 8111 遥测服务是否可达"（主菜单同样为绿色）；
         # 对局判定 connected 只驱动业务，不在此处使用。
@@ -426,6 +439,9 @@ class App:
 
         intensity_a = 0
         intensity_b = 0
+
+        if self._event_kind == "repair" and not self._repair_is_active(state):
+            self._cancel_active_event("维修已结束、失效或关闭，取消维修输出")
 
         # 事件覆盖：击杀/被击落期间用事件强度替代 G 值映射
         if self._event_remaining > 0:
@@ -506,11 +522,21 @@ class App:
         self.window.dashboard.show_event("")
 
         if had_event:
+            self._overlay_tick = 1
             self._apply_waveform()
             logger.info(reason)
 
     def _apply_event(self, ev: dict):
         """应用后台检测到的事件"""
+        if ev["kind"] == "death" and ev["mode"] == "tank":
+            self._repair_blocked_until_idle = True
+            self._repair_death_state = self._last_state
+            logger.info("坦克被击毁，作废旧维修并等待有效非维修状态")
+        elif ev["kind"] == "repair":
+            if (getattr(self, "_repair_blocked_until_idle", False)
+                    or (self._event_kind in {"kill", "death"}
+                        and self._event_remaining > 0)):
+                return
         self._event_kind = ev["kind"]
         self._event_mode = ev["mode"]
         self._event_ch_a = ev["ch_a"]
@@ -537,30 +563,37 @@ class App:
         logger.info(f"事件触发: {label} A={ev['ch_a']} B={ev['ch_b']}")
 
     def _finish_active_event(self) -> None:
-        """结束当前事件，并在仍维修时从击杀/死亡切回维修输出。"""
+        """结束当前事件，仅允许击杀结束后恢复仍有效的维修。"""
         finished_kind = self._event_kind
         self._event_kind = ""
         self._event_mode = ""
         self._event_ch_a = 0
         self._event_ch_b = 0
         self._event_remaining = 0.0
+        self._overlay_tick = 1
 
-        if (finished_kind in {"kill", "death"}
+        if (finished_kind == "kill"
                 and self._resume_repair_if_active()):
-            logger.info("击杀/死亡事件结束，检测到仍在维修，恢复维修输出")
+            logger.info("击杀事件结束，检测到仍在维修，恢复维修输出")
             return
 
         self.window.dashboard.show_event("")
         self._apply_waveform()
         logger.info("事件结束，恢复正常映射")
 
-    def _resume_repair_if_active(self) -> bool:
-        """当前坦克仍在维修且功能启用时，立即应用维修事件。"""
-        state = self._last_state
+    def _repair_is_active(self, state: GameState) -> bool:
+        """判断维修数据与开关是否有效，且旧维修未因死亡被作废。"""
         tank = state.tank if state.vehicle_type == "tank" else None
+        return bool(
+            not getattr(self, "_repair_blocked_until_idle", False)
+            and state.connected and tank and tank.valid
+            and tank.is_repairing and self._cfg.tank_events.repair_enabled
+        )
+
+    def _resume_repair_if_active(self) -> bool:
+        """当前坦克仍在有效维修且功能启用时，立即应用维修事件。"""
         config = self._cfg.tank_events
-        if (not state.connected or not tank or not tank.valid
-                or not tank.is_repairing or not config.repair_enabled):
+        if not self._repair_is_active(self._last_state):
             return False
 
         self._apply_event({
