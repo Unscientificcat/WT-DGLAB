@@ -217,3 +217,38 @@ def test_config_changes_are_logged_once_after_save(session, tmp_path):
     count = len(session.recent()[1])
     manager.save()
     assert len(session.recent()[1]) == count
+
+
+def test_prune_old_logs_by_age_and_count(tmp_path):
+    """启动清理：删除超过 30 天的日志，最多保留 50 个，不动本次日志与其他文件（代码审查修复 D5）。"""
+    import os
+    from src.runtime_logging import prune_old_logs
+    now = 1_000_000_000.0
+    day = 86400
+    old = tmp_path / "run_old.log"
+    old_export = tmp_path / "export_old.log"
+    other = tmp_path / "notes.txt"
+    current = tmp_path / "run_current.log"
+    for path in (old, old_export, other, current):
+        path.write_text("x", encoding="utf-8")
+        os.utime(path, (now - 40 * day, now - 40 * day))
+    recent = []
+    for index in range(55):
+        path = tmp_path / f"run_{index:02d}.log"
+        path.write_text("x", encoding="utf-8")
+        os.utime(path, (now - index * 60, now - index * 60))
+        recent.append(path)
+
+    removed = prune_old_logs(tmp_path, keep=(current,), now=now)
+
+    assert removed == 2 + 5
+    assert not old.exists() and not old_export.exists()
+    assert other.exists() and current.exists()
+    assert all(path.exists() for path in recent[:50])
+    assert not any(path.exists() for path in recent[50:])
+
+
+def test_prune_old_logs_missing_directory(tmp_path):
+    """日志目录不存在时不报错。"""
+    from src.runtime_logging import prune_old_logs
+    assert prune_old_logs(tmp_path / "missing") == 0

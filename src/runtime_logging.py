@@ -17,6 +17,10 @@ from .runtime_paths import application_directory
 
 _session = None
 MAX_LINES = 10_000
+# 启动时清理 logs/ 中保留下来的异常日志与导出日志
+LOG_RETENTION_DAYS = 30
+LOG_RETENTION_COUNT = 50
+_RETAINED_PATTERNS = ("run_*.log", "export_*.log")
 
 
 @dataclass
@@ -204,11 +208,50 @@ class RuntimeLogSession(logging.Handler):
         super().close()
 
 
+def prune_old_logs(directory, *, keep=(), max_age_days=LOG_RETENTION_DAYS,
+                   max_files=LOG_RETENTION_COUNT, now=None) -> int:
+    """删除超过保留天数的日志，并只保留最新的 max_files 个；返回删除数量。
+
+    只处理 run_*.log 与 export_*.log，keep 中的文件（本次会话日志）不参与；
+    正在被其他实例占用或无权限删除的文件跳过，不影响启动。
+    """
+    directory = Path(directory)
+    keep = {Path(path).resolve() for path in keep}
+    now = time.time() if now is None else now
+    entries = []
+    try:
+        for pattern in _RETAINED_PATTERNS:
+            for path in directory.glob(pattern):
+                if path.resolve() in keep or not path.is_file():
+                    continue
+                entries.append((path.stat().st_mtime, path))
+    except OSError as error:
+        logging.getLogger("WT-DGLAB").warning("日志目录扫描失败：%s", error)
+        return 0
+    entries.sort(key=lambda item: item[0], reverse=True)
+    cutoff = now - max_age_days * 86400
+    removed = 0
+    for index, (mtime, path) in enumerate(entries):
+        if index < max_files and mtime >= cutoff:
+            continue
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def start_session() -> RuntimeLogSession:
     """启动本进程会话，重复调用返回同一个活动服务。"""
     global _session
     if _session is None or _session.finished:
         _session = RuntimeLogSession()
+        removed = prune_old_logs(_session.directory, keep=(_session.path,))
+        if removed:
+            logging.getLogger("WT-DGLAB").info(
+                "已清理 %d 个过期日志（保留 %d 天内、最多 %d 个）",
+                removed, LOG_RETENTION_DAYS, LOG_RETENTION_COUNT)
     return _session
 
 

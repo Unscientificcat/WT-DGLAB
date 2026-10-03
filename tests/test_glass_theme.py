@@ -93,6 +93,12 @@ def test_card_opacity_slider_applies_and_persists(tmp_path):
     _APP.processEvents()
     assert window.settings_panel.card_opacity_value.text() == "35%"
     assert window.backdrop.card_opacity == 35
+    # 拖动中只更新内存配置，防抖计时结束后才写文件
+    assert window.settings_panel._config_mgr.config.app.card_opacity == 35
+    timer = window.settings_panel._opacity_save_timer
+    assert timer.isActive()
+    timer.timeout.emit()
+    timer.stop()
     assert ConfigManager(str(path)).load().app.card_opacity == 35
 
     slider.setValue(72)
@@ -144,4 +150,26 @@ def test_event_card_is_always_expanded(tmp_path):
     assert card.findChild(QToolButton, "eventToggle") is None
     assert card.findChild(QWidget, "collapsibleContent") is None
     assert card.isVisible()
+    window.close()
+
+
+def test_card_opacity_drag_does_not_rebuild_background(tmp_path, monkeypatch):
+    """拖动不透明度不重新扫描壁纸目录、不重建模糊缓存，只写一次文件（C1）。"""
+    path = tmp_path / "config.json"
+    manager = ConfigManager(str(path))
+    window = MainWindow(manager)
+    saves = []
+    rebuilds = []
+    monkeypatch.setattr(manager, "save", lambda: saves.append(1))
+    monkeypatch.setattr(window.backdrop, "_rebuild_cache", lambda: rebuilds.append(1))
+    monkeypatch.setattr(window._background_catalog, "reload",
+                        lambda: rebuilds.append("reload"))
+    for value in range(30, 60):
+        window.settings_panel.card_opacity_slider.setValue(value)
+    assert rebuilds == []
+    assert saves == []
+    assert window.backdrop.card_opacity == 59
+    window.settings_panel.flush_pending_save()
+    assert saves == [1]
+    assert not window.settings_panel._opacity_save_timer.isActive()
     window.close()

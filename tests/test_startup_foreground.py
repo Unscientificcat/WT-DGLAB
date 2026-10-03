@@ -44,7 +44,9 @@ def test_app_shows_main_window_before_first_disclaimer():
     call_order = []
     app = App.__new__(App)
     app.config_mgr = SimpleNamespace(
-        config=SimpleNamespace(app=SimpleNamespace(notice_accepted=False))
+        config=SimpleNamespace(app=SimpleNamespace(notice_accepted=False)),
+        load_issues=[],
+        invalid_backup_path="",
     )
     app.window = SimpleNamespace(
         show_startup=Mock(side_effect=lambda: call_order.append("window"))

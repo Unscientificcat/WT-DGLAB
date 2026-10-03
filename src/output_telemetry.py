@@ -50,7 +50,7 @@ class OutputTelemetry:
     输出电压曲线窗口。
     """
 
-    def __init__(self, max_batches: int = 40):
+    def __init__(self, max_batches: int = 240):
         # 可重入锁：允许持锁状态下调用同类加锁方法
         self._lock = threading.RLock()
         self._max_batches = max(1, int(max_batches))
@@ -71,13 +71,14 @@ class OutputTelemetry:
         with self._lock:
             self._names[self._key(channel)] = str(name or CONSTANT_WAVEFORM)
 
-    def record_pulse(self, channel: str, amplitudes, strength: int) -> None:
-        """记录一次实际下发的波形批次。"""
+    def record_pulse(self, channel: str, amplitudes, strength: int,
+                     played_at: float | None = None) -> None:
+        """记录发送帧与预计播放时刻，不代表硬件实测值。"""
         amps = tuple(max(0, min(100, int(value))) for value in amplitudes)
         while len(amps) < 4:
             amps += (0,)
         batch = PulseBatch(
-            time.monotonic(),
+            played_at if played_at is not None else time.monotonic(),
             amps[:4],
             max(0, min(200, int(strength))),
         )
@@ -92,9 +93,19 @@ class OutputTelemetry:
         batch = PulseBatch(time.monotonic(), (0, 0, 0, 0), 0)
         with self._lock:
             key = self._key(channel)
+            self.replace_future(channel, batch.t)
             self._batches[key].append(batch)
             self._strengths[key] = 0
             self._active[key] = False
+
+    def replace_future(self, channel: str, at: float) -> None:
+        """撤销 App 已被替换或清理的未来播放窗口。"""
+        with self._lock:
+            key = self._key(channel)
+            self._batches[key] = deque(
+                (batch for batch in self._batches[key] if batch.t < at),
+                maxlen=self._max_batches,
+            )
 
     def reset(self) -> None:
         """清空输出记录（连接断开时调用），波形名保留。"""

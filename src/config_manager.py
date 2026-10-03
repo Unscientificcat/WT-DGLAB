@@ -4,7 +4,9 @@ import json
 import logging
 import math
 import os
-from dataclasses import dataclass, field, asdict
+import shutil
+import time
+from dataclasses import dataclass, field, fields, asdict
 from urllib.parse import urlsplit
 
 # 悬浮窗主字号（G 值大字，像素）线性调节范围
@@ -23,6 +25,8 @@ class AircraftSettings:
     gforce_max: float = 10.0
     channel_a_max: int = 0
     channel_b_max: int = 0
+    curve: str = "linear"          # 触发曲线: "linear" / "exp" / "log"
+    curve_steepness: float = 2.0   # 曲线陡度参数
     waveform_a: str = "恒定"
     waveform_b: str = "恒定"
     random_enabled_a: bool = False
@@ -41,6 +45,17 @@ class TankSettings:
     speed_max: float = 60.0
     channel_a_max: int = 0
     channel_b_max: int = 0
+    curve: str = "linear"          # 触发曲线: "linear" / "exp" / "log"
+    curve_steepness: float = 2.0   # 曲线陡度参数
+    idle_enabled: bool = False     # 静止惩罚：速度为 0 超时后持续电击
+    idle_timeout_s: float = 10.0   # 静止持续此时长后触发 (秒)
+    idle_speed_max: float = 2.0    # 低于该速度视为静止 (km/h)
+    idle_ch_a: int = 0
+    idle_ch_b: int = 0
+    idle_wf_a: str = "恒定"
+    idle_wf_b: str = "恒定"
+    idle_random_a: bool = False     # 静止惩罚触发时随机切换波形
+    idle_random_b: bool = False
     waveform_a: str = "恒定"
     waveform_b: str = "恒定"
     random_enabled_a: bool = False
@@ -59,6 +74,8 @@ class CasSettings:
     gforce_max: float = 10.0
     channel_a_max: int = 0
     channel_b_max: int = 0
+    curve: str = "linear"          # 触发曲线: "linear" / "exp" / "log"
+    curve_steepness: float = 2.0   # 曲线陡度参数
     waveform_a: str = "恒定"
     waveform_b: str = "恒定"
     random_enabled_a: bool = False
@@ -112,12 +129,21 @@ class TankEventSettings:
     repair_ch_b: int = 0
     repair_wf_a: str = "恒定"
     repair_wf_b: str = "恒定"
+    hit_enabled: bool = False          # 被命中短脉冲开关
+    hit_ch_a: int = 0
+    hit_ch_b: int = 0
+    hit_duration: float = 0.5          # 被命中输出时长 (秒)
+    hit_wf_a: str = "恒定"
+    hit_wf_b: str = "恒定"
+    hit_cooldown: float = 2.0          # 两次被命中之间的冷却 (秒)
     kill_random_a: bool = False
     kill_random_b: bool = False
     death_random_a: bool = False
     death_random_b: bool = False
     repair_random_a: bool = False
     repair_random_b: bool = False
+    hit_random_a: bool = False
+    hit_random_b: bool = False
 
 
 @dataclass
@@ -159,10 +185,25 @@ class Config:
 class ConfigManager:
     """配置管理器 — 负责配置的加载、保存和默认值重置"""
 
+    # 配置文件各节对应的数据类，用于逐字段预检数值类型
+    _SECTION_TYPES = {
+        "aircraft": AircraftSettings,
+        "tank": TankSettings,
+        "cas": CasSettings,
+        "events": EventSettings,
+        "tank_events": TankEventSettings,
+        "app": AppSettings,
+    }
+
     def __init__(self, config_path: str = "config.json"):
         self._config_path = config_path
         self._config: Config = Config()
         self._last_logged_config = self._to_dict()
+        # 最近一次 load() 修正过的字段说明，以及原文件备份路径
+        self.load_issues: list[str] = []
+        self.invalid_backup_path: str = ""
+        # 启动时写入失败的原因（如程序目录只读），供界面提示
+        self.save_error: str = ""
 
     @property
     def config(self) -> Config:
@@ -175,8 +216,15 @@ class ConfigManager:
         return os.path.abspath(self._config_path)
 
     def load(self) -> Config:
-        """从文件加载配置，文件不存在时使用默认值"""
+        """从文件加载配置，文件不存在时使用默认值
+
+        单个字段非法时只回退该字段；文件整体无法解析时回退全部默认值。
+        两种情况都会先把原文件备份为 config.json.invalid-时间戳，
+        避免后续保存覆盖用户设置后无法找回。
+        """
         config_path = self.config_path
+        self.load_issues = []
+        self.invalid_backup_path = ""
         if os.path.exists(config_path):
             try:
                 with open(config_path, "r", encoding="utf-8") as f:
@@ -188,8 +236,26 @@ class ConfigManager:
                     "配置文件无效，使用默认值", exc_info=True)
                 # 配置文件损坏时使用默认值
                 self._config = Config()
+                self.load_issues = ["配置文件无法解析，已全部恢复默认值"]
+            if self.load_issues:
+                self._backup_invalid_file(config_path)
         self._last_logged_config = self._to_dict()
         return self._config
+
+    def _backup_invalid_file(self, config_path: str) -> None:
+        """回退默认值前备份原配置文件，备份失败只记录日志。"""
+        log = logging.getLogger("ConfigManager")
+        backup_path = (f"{config_path}.invalid-"
+                       f"{time.strftime('%Y%m%d-%H%M%S')}")
+        try:
+            shutil.copy2(config_path, backup_path)
+        except OSError:
+            log.error("配置文件备份失败：%s", backup_path, exc_info=True)
+        else:
+            self.invalid_backup_path = backup_path
+            log.warning("原配置文件已备份：%s", backup_path)
+        for issue in self.load_issues:
+            log.warning("配置修正：%s", issue)
 
     def load_template(self, template_path: str) -> Config:
         """加载默认配置模板；模板缺失或损坏时回退内置默认值。"""
@@ -261,10 +327,19 @@ class ConfigManager:
         """将字典数据应用到配置对象"""
         if not isinstance(data, dict):
             raise TypeError("配置根节点必须是对象")
+        # 逐字段预检：类型错误或非有限数值的字段丢弃后使用默认值，其余保留
+        issues: list[str] = []
+        data = self._coerce_sections(data, issues)
+
         def waveform(value) -> str:
             value = str(value or "恒定")
             # 旧版本预设和随机选项均不再存在。
             return value if value == "恒定" or value.lower().endswith(".pulse") else "恒定"
+
+        def curve(value) -> str:
+            # 触发曲线名非法时静默回退线性，与协议字段的容错方式一致。
+            value = str(value or "linear").lower()
+            return value if value in ("linear", "exp", "log") else "linear"
 
         def random_range(section: dict, suffix: str = "") -> tuple[bool, int, int]:
             enabled = bool(section.get(f"random_enabled{suffix}", False))
@@ -285,6 +360,8 @@ class ConfigManager:
                 gforce_max=float(ac.get("gforce_max", 10.0)),
                 channel_a_max=int(ac.get("channel_a_max", 0)),
                 channel_b_max=int(ac.get("channel_b_max", 0)),
+                curve=curve(ac.get("curve")),
+                curve_steepness=float(ac.get("curve_steepness", 2.0)),
                 waveform_a=waveform(ac.get("waveform_a")),
                 waveform_b=waveform(ac.get("waveform_b")),
                 random_enabled_a=ea, random_enabled_b=eb,
@@ -301,6 +378,17 @@ class ConfigManager:
                 speed_max=float(tk.get("speed_max", 60)),
                 channel_a_max=int(tk.get("channel_a_max", 0)),
                 channel_b_max=int(tk.get("channel_b_max", 0)),
+                curve=curve(tk.get("curve")),
+                curve_steepness=float(tk.get("curve_steepness", 2.0)),
+                idle_enabled=bool(tk.get("idle_enabled", False)),
+                idle_timeout_s=float(tk.get("idle_timeout_s", 10.0)),
+                idle_speed_max=float(tk.get("idle_speed_max", 2.0)),
+                idle_ch_a=int(tk.get("idle_ch_a", 0)),
+                idle_ch_b=int(tk.get("idle_ch_b", 0)),
+                idle_wf_a=waveform(tk.get("idle_wf_a")),
+                idle_wf_b=waveform(tk.get("idle_wf_b")),
+                idle_random_a=bool(tk.get("idle_random_a", False)),
+                idle_random_b=bool(tk.get("idle_random_b", False)),
                 waveform_a=waveform(tk.get("waveform_a")),
                 waveform_b=waveform(tk.get("waveform_b")),
                 random_enabled_a=ea, random_enabled_b=eb,
@@ -328,12 +416,21 @@ class ConfigManager:
                 repair_ch_b=int(te.get("repair_ch_b", 0)),
                 repair_wf_a=waveform(te.get("repair_wf_a")),
                 repair_wf_b=waveform(te.get("repair_wf_b")),
+                hit_enabled=bool(te.get("hit_enabled", False)),
+                hit_ch_a=int(te.get("hit_ch_a", 0)),
+                hit_ch_b=int(te.get("hit_ch_b", 0)),
+                hit_duration=float(te.get("hit_duration", 0.5)),
+                hit_wf_a=waveform(te.get("hit_wf_a")),
+                hit_wf_b=waveform(te.get("hit_wf_b")),
+                hit_cooldown=float(te.get("hit_cooldown", 2.0)),
                 kill_random_a=bool(te.get("kill_random_a", False)),
                 kill_random_b=bool(te.get("kill_random_b", False)),
                 death_random_a=bool(te.get("death_random_a", False)),
                 death_random_b=bool(te.get("death_random_b", False)),
                 repair_random_a=bool(te.get("repair_random_a", False)),
                 repair_random_b=bool(te.get("repair_random_b", False)),
+                hit_random_a=bool(te.get("hit_random_a", False)),
+                hit_random_b=bool(te.get("hit_random_b", False)),
             )
         if "cas" in data:
             cs = data["cas"]
@@ -343,6 +440,8 @@ class ConfigManager:
                 gforce_max=float(cs.get("gforce_max", 10.0)),
                 channel_a_max=int(cs.get("channel_a_max", 0)),
                 channel_b_max=int(cs.get("channel_b_max", 0)),
+                curve=curve(cs.get("curve")),
+                curve_steepness=float(cs.get("curve_steepness", 2.0)),
                 waveform_a=waveform(cs.get("waveform_a")),
                 waveform_b=waveform(cs.get("waveform_b")),
                 random_enabled_a=random_range(cs, "_a")[0], random_enabled_b=random_range(cs, "_b")[0],
@@ -401,7 +500,7 @@ class ConfigManager:
                 background_image=str(ap.get("background_image", "")),
                 card_opacity=int(ap.get("card_opacity", 72)),
             )
-        self._validate_config()
+        self.load_issues = issues + self._sanitize_config()
 
     @staticmethod
     def _read_overlay_value_px(ap: dict) -> int:
@@ -413,56 +512,122 @@ class ConfigManager:
             )
         return max(OVERLAY_VALUE_PX_MIN, min(OVERLAY_VALUE_PX_MAX, int(raw)))
 
-    def _validate_config(self) -> None:
-        """校验从磁盘读取的配置，拒绝越界、非有限数值和错误枚举。"""
-        sections = (self._config.aircraft, self._config.tank, self._config.cas,
-                    self._config.events, self._config.tank_events)
-        for section in sections:
-            for name, value in vars(section).items():
-                if isinstance(value, (int, float)) and not math.isfinite(value):
-                    raise ValueError(f"配置字段 {name} 不是有限数值")
+    @classmethod
+    def _coerce_sections(cls, data: dict, issues: list[str]) -> dict:
+        """逐字段预检数值类型，返回清理后的浅拷贝。
 
-        for section in sections:
-            for name, value in vars(section).items():
-                if name.endswith(("_ch_a", "_ch_b")) and not 0 <= value <= 200:
-                    raise ValueError(f"配置字段 {name} 超出 0..200")
+        非对象的节整节丢弃；无法转换为数字、布尔值冒充数字或非有限数值的
+        字段从拷贝中删除，由后续构造使用 dataclass 默认值，其余字段保留。
+        """
+        result = dict(data)
+        for section_name, section_type in cls._SECTION_TYPES.items():
+            if section_name not in data:
+                continue
+            raw_section = data[section_name]
+            if not isinstance(raw_section, dict):
+                issues.append(f"{section_name} 节不是对象，已整节恢复默认")
+                result.pop(section_name)
+                continue
+            section = dict(raw_section)
+            numeric = {item.name: item.type for item in fields(section_type)
+                       if item.type in (int, float, "int", "float")}
+            if section_name in ("aircraft", "tank", "cas"):
+                # 旧版随机间隔字段，迁移时会被 random_range 读取
+                numeric["random_interval"] = int
+            for name, kind in numeric.items():
+                if name not in section:
+                    continue
+                raw = section[name]
+                try:
+                    if isinstance(raw, bool):
+                        raise TypeError("布尔值不能作为数值")
+                    value = float(raw)
+                    if not math.isfinite(value):
+                        raise ValueError("非有限数值")
+                    converted = int(value) if kind in (int, "int") else value
+                except (TypeError, ValueError, OverflowError):
+                    issues.append(
+                        f"{section_name}.{name} 值 {repr(raw)[:40]} 无效，已恢复默认")
+                    del section[name]
+                    continue
+                section[name] = converted
+            result[section_name] = section
+        return result
 
-        for section, lower_name, upper_name in (
-                (self._config.aircraft, "gforce_min", "gforce_max"),
-                (self._config.tank, "speed_min", "speed_max"),
-                (self._config.cas, "gforce_min", "gforce_max")):
-            if (getattr(section, lower_name) < 0
-                    or getattr(section, upper_name) < 0
-                    or any(not 5 <= getattr(section, n) <= 300 for n in ("random_min_a", "random_max_a", "random_min_b", "random_max_b"))
-                    or any(getattr(section, lo) > getattr(section, hi) for lo, hi in (("random_min_a", "random_max_a"), ("random_min_b", "random_max_b")))):
-                raise ValueError("触发范围或随机间隔超出有效范围")
+    def _sanitize_config(self) -> list[str]:
+        """把越界、非法枚举或 min>max 的字段逐个恢复为默认值，返回修正说明。"""
+        issues: list[str] = []
+        defaults = Config()
 
-        for obj in (self._config.events, self._config.tank_events):
-            for field_name in ("kill_duration", "death_duration"):
-                duration = getattr(obj, field_name)
-                if duration < 0.1 or duration > 30:
-                    raise ValueError(f"配置字段 {field_name} 超出有效范围")
+        def reset(section_name: str, names: tuple[str, ...], reason: str) -> None:
+            section = getattr(self._config, section_name)
+            default_section = getattr(defaults, section_name)
+            for name in names:
+                setattr(section, name, getattr(default_section, name))
+            issues.append(f"{section_name}.{'/'.join(names)} {reason}，已恢复默认")
+
+        def check_range(section_name: str, name: str, low: float,
+                        high: float = math.inf) -> None:
+            value = getattr(getattr(self._config, section_name), name)
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or not low <= value <= high):
+                bound = f"{low}..{high}" if math.isfinite(high) else f"≥{low}"
+                reset(section_name, (name,), f"值 {value!r} 超出 {bound}")
+
+        def check_pair(section_name: str, low_name: str, high_name: str) -> None:
+            section = getattr(self._config, section_name)
+            if getattr(section, low_name) > getattr(section, high_name):
+                reset(section_name, (low_name, high_name), "最小值大于最大值")
+
+        # 各通道强度（含事件强度与模式最大强度）必须在 0..200
+        for section_name in ("aircraft", "tank", "cas", "events", "tank_events"):
+            for name in vars(getattr(self._config, section_name)):
+                if name.endswith(("_ch_a", "_ch_b")) or name in (
+                        "channel_a_max", "channel_b_max"):
+                    check_range(section_name, name, 0, 200)
+
+        # 触发范围、随机间隔与曲线陡度
+        for section_name, low_name, high_name in (
+                ("aircraft", "gforce_min", "gforce_max"),
+                ("tank", "speed_min", "speed_max"),
+                ("cas", "gforce_min", "gforce_max")):
+            check_range(section_name, low_name, 0)
+            check_range(section_name, high_name, 0)
+            check_pair(section_name, low_name, high_name)
+            for suffix in ("_a", "_b"):
+                check_range(section_name, f"random_min{suffix}", 5, 300)
+                check_range(section_name, f"random_max{suffix}", 5, 300)
+                check_pair(section_name, f"random_min{suffix}",
+                           f"random_max{suffix}")
+            check_range(section_name, "curve_steepness", 1.0, 6.0)
+
+        check_range("tank", "idle_timeout_s", 1.0, 120.0)
+        check_range("tank", "idle_speed_max", 0, 50.0)
+
+        for section_name in ("events", "tank_events"):
+            check_range(section_name, "kill_duration", 0.1, 30)
+            check_range(section_name, "death_duration", 0.1, 30)
+        check_range("tank_events", "hit_duration", 0.1, 30)
+        check_range("tank_events", "hit_cooldown", 0, 30)
 
         app = self._config.app
-        if not 1024 <= app.ws_port <= 65535:
-            raise ValueError("V3 端口超出有效范围")
-        if not 50 <= app.refresh_interval_ms <= 1000:
-            raise ValueError("刷新间隔超出有效范围")
+        check_range("app", "ws_port", 1024, 65535)
+        check_range("app", "refresh_interval_ms", 50, 1000)
+        check_range("app", "overlay_size_px",
+                    OVERLAY_VALUE_PX_MIN, OVERLAY_VALUE_PX_MAX)
+        check_range("app", "card_opacity", 20, 90)
         if app.dglab_protocol not in {"v3", "v4"}:
-            raise ValueError("未知 DG-LAB 协议")
+            reset("app", ("dglab_protocol",), f"值 {app.dglab_protocol!r} 未知")
         if app.mode not in {"aircraft", "tank"}:
-            raise ValueError("未知游戏模式")
-        if not OVERLAY_VALUE_PX_MIN <= app.overlay_size_px <= OVERLAY_VALUE_PX_MAX:
-            raise ValueError("悬浮窗字号超出有效范围")
-        if not 20 <= app.card_opacity <= 90:
-            raise ValueError("卡片不透明度超出 20..90 范围")
+            reset("app", ("mode",), f"值 {app.mode!r} 未知")
         background_name = app.background_image
-        if background_name:
-            if (background_name in {".", ".."}
-                    or "/" in background_name
-                    or "\\" in background_name
-                    or ".." in background_name
-                    or os.path.basename(background_name) != background_name
-                    or os.path.splitext(background_name)[1].lower()
-                    not in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}):
-                raise ValueError("壁纸文件名无效")
+        if background_name and (
+                background_name in {".", ".."}
+                or "/" in background_name
+                or "\\" in background_name
+                or ".." in background_name
+                or os.path.basename(background_name) != background_name
+                or os.path.splitext(background_name)[1].lower()
+                not in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}):
+            reset("app", ("background_image",), "壁纸文件名无效")
+        return issues

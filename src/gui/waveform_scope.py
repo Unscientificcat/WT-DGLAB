@@ -52,7 +52,7 @@ class WaveformScope(QWidget):
     def _build_points(self, now: float) -> list[tuple[float, float]]:
         """把批次采样点平铺为 (时刻, 电压) 折线点，旧→新。"""
         window_start = now - WINDOW_SECONDS
-        recent = [item for item in self._batches if item.t >= window_start]
+        recent = [item for item in self._batches if window_start <= item.t <= now]
         if not recent or (now - recent[-1].t) > STALE_SECONDS:
             return []
         points: list[tuple[float, float]] = []
@@ -160,6 +160,10 @@ class ChannelScopeDialog(QDialog):
         self.info_label = QLabel("未连接郊狼设备")
         self.info_label.setObjectName("scopeInfoLabel")
         layout.addWidget(self.info_label)
+        self.estimate_label = QLabel("按下发波形估算的播放曲线，非设备电压实测")
+        self.estimate_label.setObjectName("scopeEstimateHint")
+        self.estimate_label.setWordWrap(True)
+        layout.addWidget(self.estimate_label)
 
         self.scope = WaveformScope(color, self)
         layout.addWidget(self.scope, 1)

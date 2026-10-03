@@ -1,6 +1,7 @@
 """PySide6 主窗口，包含实时状态、设置和设备连接区域。"""
 
 import ctypes
+import logging
 import os
 import sys
 from typing import Callable
@@ -57,6 +58,9 @@ from ..runtime_paths import resource_path
 from ..output_telemetry import display_waveform_name
 from ..waveforms import WaveformCatalog
 from .overlay import OVERLAY_CONTENT_FLAGS
+
+# 滑条类设置停止拖动后写入配置文件的防抖间隔（毫秒）
+SAVE_DEBOUNCE_MS = 300
 
 
 def _resource_path(filename: str) -> str:
@@ -281,6 +285,9 @@ class ChannelCard(GlassCard):
         """显示强度数值与进度。"""
         value = max(0, min(200, int(value)))
         self.value.setText(str(value))
+        # 主线程每次刷新都会调用：目标未变时不重启动画
+        if value == self._animation.endValue():
+            return
         current = self.progress.value()
         self._animation.stop()
         self._animation.setStartValue(current)
@@ -324,6 +331,8 @@ class Dashboard(QFrame):
         self._event_animation.setLoopCount(-1)
         self._event_animation.setEasingCurve(QEasingCurve.InOutSine)
         self.setProperty("eventGlow", 0.0)
+        # 上次应用的边框样式；相同则跳过 setStyleSheet（会触发整棵子树重新抛光）
+        self._event_style = ""
         self._event_animation.valueChanged.connect(self._update_event_style)
         self._build()
 
@@ -587,11 +596,19 @@ class Dashboard(QFrame):
 
     def _update_event_style(self) -> None:
         """更新事件期间的呼吸边框。"""
-        glow = float(self.property("eventGlow") or 0.0)
-        self.setStyleSheet(
-            f"QFrame#dashboardPanel {{ border: 1px solid rgba(236, 141, 167, {0.35 + glow * 0.45:.2f}); }}"
-            if self.event_label.text() else ""
-        )
+        style = ""
+        if self.event_label.text():
+            glow = float(self.property("eventGlow") or 0.0)
+            # 透明度量化到 0.05 一档：动画每帧都会回调，档位不变时不重设样式
+            alpha = round((0.35 + glow * 0.45) * 20) / 20
+            style = (
+                "QFrame#dashboardPanel { border: 1px solid "
+                f"rgba(236, 141, 167, {alpha:.2f}); }}"
+            )
+        if style == self._event_style:
+            return
+        self._event_style = style
+        self.setStyleSheet(style)
 
     def clear(self, mode: str = "aircraft") -> None:
         """清空无效游戏数据。"""
@@ -689,9 +706,16 @@ class SettingsPanel(QFrame):
                  connection_widget=None,
                  dashboard_widget=None,
                  appearance_changed: Callable | None = None,
-                 background_catalog: BackgroundCatalog | None = None):
+                 background_catalog: BackgroundCatalog | None = None,
+                 card_opacity_changed: Callable[[int], None] | None = None):
         super().__init__(parent)
         self.setObjectName("settingsPanel")
+        self._card_opacity_changed = card_opacity_changed
+        # 滑条拖动时只即时刷新玻璃层，停止拖动 300ms 后再写配置文件
+        self._opacity_save_timer = QTimer(self)
+        self._opacity_save_timer.setSingleShot(True)
+        self._opacity_save_timer.setInterval(SAVE_DEBOUNCE_MS)
+        self._opacity_save_timer.timeout.connect(config_mgr.save)
         self._config_mgr = config_mgr
         self._on_save_callback = on_save
         self._overlay_var = overlay_var
@@ -868,8 +892,8 @@ class SettingsPanel(QFrame):
         self.air_trigger_card = card
         self.ac_enabled = QCheckBox("启用过载触发")
         self.ac_enabled.setObjectName("aircraftEnabled")
-        self.gforce_min = self._double_box(0, 20, 0.5, " G")
-        self.gforce_max = self._double_box(0, 20, 0.5, " G")
+        self.gforce_min = self._double_box(0, 20, 0.5, " G", decimals=2)
+        self.gforce_max = self._double_box(0, 20, 0.5, " G", decimals=2)
         self.ac_ch_a = self._int_box(0, 200)
         self.ac_ch_b = self._int_box(0, 200)
         self.ac_wf_a = self._combo(self._waveforms)
@@ -878,6 +902,7 @@ class SettingsPanel(QFrame):
         form.addRow(self.ac_enabled)
         self._add_row(form, "过载下限", self.gforce_min)
         self._add_row(form, "过载上限", self.gforce_max)
+        self._make_curve_controls(form, "ac")
         self._add_row(form, "A 通道最大强度", self.ac_ch_a)
         self._add_row(form, "B 通道最大强度", self.ac_ch_b)
         layout.addWidget(card)
@@ -901,8 +926,8 @@ class SettingsPanel(QFrame):
         self.tank_trigger_card = card
         self.tank_enabled = QCheckBox("启用速度触发")
         self.tank_enabled.setObjectName("tankEnabled")
-        self.speed_min = self._double_box(0, 200, 1, " km/h")
-        self.speed_max = self._double_box(0, 200, 1, " km/h")
+        self.speed_min = self._double_box(0, 200, 1, " km/h", decimals=2)
+        self.speed_max = self._double_box(0, 200, 1, " km/h", decimals=2)
         self.tank_ch_a = self._int_box(0, 200)
         self.tank_ch_b = self._int_box(0, 200)
         self.tank_wf_a = self._combo(self._waveforms)
@@ -911,6 +936,7 @@ class SettingsPanel(QFrame):
         form.addRow(self.tank_enabled)
         self._add_row(form, "速度下限", self.speed_min)
         self._add_row(form, "速度上限", self.speed_max)
+        self._make_curve_controls(form, "tank")
         self._add_row(form, "A 通道最大强度", self.tank_ch_a)
         self._add_row(form, "B 通道最大强度", self.tank_ch_b)
         layout.addWidget(card)
@@ -919,8 +945,8 @@ class SettingsPanel(QFrame):
         self.cas_card = cas_card
         self.cas_enabled = QCheckBox("启用 CAS 触发")
         self.cas_enabled.setObjectName("casEnabled")
-        self.cas_gforce_min = self._double_box(0, 20, 0.5, " G")
-        self.cas_gforce_max = self._double_box(0, 20, 0.5, " G")
+        self.cas_gforce_min = self._double_box(0, 20, 0.5, " G", decimals=2)
+        self.cas_gforce_max = self._double_box(0, 20, 0.5, " G", decimals=2)
         self.cas_ch_a = self._int_box(0, 200)
         self.cas_ch_b = self._int_box(0, 200)
         self.cas_wf_a = self._combo(self._waveforms)
@@ -929,11 +955,12 @@ class SettingsPanel(QFrame):
         cas_form.addRow(self.cas_enabled)
         self._add_row(cas_form, "过载下限", self.cas_gforce_min)
         self._add_row(cas_form, "过载上限", self.cas_gforce_max)
+        self._make_curve_controls(cas_form, "cas")
         self._add_row(cas_form, "A 通道最大强度", self.cas_ch_a)
         self._add_row(cas_form, "B 通道最大强度", self.cas_ch_b)
         layout.addWidget(cas_card)
 
-        event_card, event_layout = self._make_event_section("事件设置", "陆战击杀、被击毁与维修反馈")
+        event_card, event_layout = self._make_event_section("事件设置", "陆战击杀、被击毁、部件损伤、维修与静止惩罚反馈")
         self.tank_event_card = event_card
         self.tank_event_name = QLineEdit()
         self.tank_event_name.setObjectName("tankEventName")
@@ -946,6 +973,23 @@ class SettingsPanel(QFrame):
         self.tank_repair_b = repair["b"]
         self.tank_repair_wf_a = repair["wf_a"]
         self.tank_repair_wf_b = repair["wf_b"]
+        self._make_event_controls(event_layout, "tank_hit", "部件损伤短脉冲")
+        self.tank_hit_cooldown = self._double_box(0, 30, 0.5, " 秒")
+        self._add_row(event_layout, "  冷却时间", self.tank_hit_cooldown)
+
+        # 静止惩罚：速度为 0 超时后持续电击，直到恢复移动
+        # （波形与触发时随机切换在"波形设置"页面的陆战场景中配置）
+        self.tank_idle_enabled = QCheckBox("静止惩罚")
+        self.tank_idle_enabled.setObjectName("tankIdleEnabled")
+        self.tank_idle_speed_max = self._double_box(0, 50, 0.5, " km/h")
+        self.tank_idle_timeout = self._double_box(1, 120, 1, " 秒")
+        self.tank_idle_ch_a = self._int_box(0, 200)
+        self.tank_idle_ch_b = self._int_box(0, 200)
+        event_layout.addRow(self.tank_idle_enabled)
+        self._add_row(event_layout, "  静止判定阈值", self.tank_idle_speed_max)
+        self._add_row(event_layout, "  超时秒数", self.tank_idle_timeout)
+        self._add_row(event_layout, "  A 通道强度", self.tank_idle_ch_a)
+        self._add_row(event_layout, "  B 通道强度", self.tank_idle_ch_b)
         layout.addWidget(event_card)
 
     def _make_section(self, title: str, subtitle: str) -> tuple[QFrame, QFormLayout]:
@@ -969,6 +1013,45 @@ class SettingsPanel(QFrame):
         layout.addSpacing(3)
         layout.addLayout(form)
         return card, form
+
+    # 触发曲线选项：(界面显示名, 配置存储键)
+    CURVE_OPTIONS = (
+        ("线性", "linear"),
+        ("指数（后段更猛）", "exp"),
+        ("对数（前段更猛）", "log"),
+    )
+
+    def _make_curve_controls(self, form: QFormLayout, prefix: str) -> None:
+        """创建触发曲线与陡度控件组；线性时陡度输入框置灰。"""
+        combo = self._combo([label for label, _key in self.CURVE_OPTIONS])
+        steepness = self._double_box(1.0, 6.0, 0.1)
+        steepness.setEnabled(False)
+        combo.currentIndexChanged.connect(
+            lambda index: steepness.setEnabled(
+                self.CURVE_OPTIONS[index][1] != "linear"))
+        setattr(self, f"{prefix}_curve", combo)
+        setattr(self, f"{prefix}_curve_steepness", steepness)
+        self._add_row(form, "触发曲线", combo)
+        self._add_row(form, "曲线陡度", steepness)
+
+    def _load_curve_controls(self, prefix: str, config) -> None:
+        """将触发曲线配置加载到控件。"""
+        key = getattr(config, "curve", "linear")
+        combo = getattr(self, f"{prefix}_curve")
+        index = next((i for i, (_label, name) in enumerate(self.CURVE_OPTIONS)
+                      if name == key), 0)
+        combo.setCurrentIndex(index)
+        steepness_box = getattr(self, f"{prefix}_curve_steepness")
+        steepness_box.setValue(getattr(config, "curve_steepness", 2.0))
+        steepness_box.setEnabled(key != "linear")
+
+    def _save_curve_controls(self, prefix: str, config) -> None:
+        """从控件保存触发曲线配置。"""
+        combo = getattr(self, f"{prefix}_curve")
+        key = self.CURVE_OPTIONS[combo.currentIndex()][1]
+        setattr(config, "curve", key)
+        setattr(config, "curve_steepness",
+                getattr(self, f"{prefix}_curve_steepness").value())
 
     def _make_event_section(self, title: str, subtitle: str) -> tuple[QFrame, QFormLayout]:
         """创建始终展开的事件设置区块。"""
@@ -1041,13 +1124,14 @@ class SettingsPanel(QFrame):
         return box
 
     def _double_box(self, minimum: float, maximum: float, step: float,
-                    suffix: str = "") -> NoWheelDoubleSpinBox:
+                    suffix: str = "", decimals: int = 1) -> NoWheelDoubleSpinBox:
         """创建小数输入框。"""
         box = NoWheelDoubleSpinBox()
         box.setObjectName("decimalInput")
+        # 先设小数位再设范围，避免范围端点按旧精度取整
+        box.setDecimals(decimals)
         box.setRange(minimum, maximum)
         box.setSingleStep(step)
-        box.setDecimals(1)
         box.setSuffix(suffix)
         return box
 
@@ -1087,6 +1171,7 @@ class SettingsPanel(QFrame):
         self.gforce_max.setValue(ac.gforce_max)
         self.ac_ch_a.setValue(ac.channel_a_max)
         self.ac_ch_b.setValue(ac.channel_b_max)
+        self._load_curve_controls("ac", ac)
         self._set_combo_value(self.ac_wf_a, ac.waveform_a)
         self._set_combo_value(self.ac_wf_b, ac.waveform_b)
         self.ac_wf_interval.setValue(ac.random_min_a)
@@ -1097,6 +1182,12 @@ class SettingsPanel(QFrame):
         self.speed_max.setValue(tank.speed_max)
         self.tank_ch_a.setValue(tank.channel_a_max)
         self.tank_ch_b.setValue(tank.channel_b_max)
+        self._load_curve_controls("tank", tank)
+        self.tank_idle_enabled.setChecked(tank.idle_enabled)
+        self.tank_idle_speed_max.setValue(tank.idle_speed_max)
+        self.tank_idle_timeout.setValue(tank.idle_timeout_s)
+        self.tank_idle_ch_a.setValue(tank.idle_ch_a)
+        self.tank_idle_ch_b.setValue(tank.idle_ch_b)
         self._set_combo_value(self.tank_wf_a, tank.waveform_a)
         self._set_combo_value(self.tank_wf_b, tank.waveform_b)
         self.tank_wf_interval.setValue(tank.random_min_a)
@@ -1107,6 +1198,7 @@ class SettingsPanel(QFrame):
         self.cas_gforce_max.setValue(cas.gforce_max)
         self.cas_ch_a.setValue(cas.channel_a_max)
         self.cas_ch_b.setValue(cas.channel_b_max)
+        self._load_curve_controls("cas", cas)
         self._set_combo_value(self.cas_wf_a, cas.waveform_a)
         self._set_combo_value(self.cas_wf_b, cas.waveform_b)
         self.cas_wf_interval.setValue(cas.random_min_a)
@@ -1122,6 +1214,8 @@ class SettingsPanel(QFrame):
         self.tank_repair_b.setValue(cfg.tank_events.repair_ch_b)
         self._set_combo_value(self.tank_repair_wf_a, cfg.tank_events.repair_wf_a)
         self._set_combo_value(self.tank_repair_wf_b, cfg.tank_events.repair_wf_b)
+        self._load_event_controls("tank_hit", cfg.tank_events, "hit")
+        self.tank_hit_cooldown.setValue(cfg.tank_events.hit_cooldown)
 
         self._connection_widget.ws_port.setValue(cfg.app.ws_port)
         self._connection_widget.v4_relay_url.setText(cfg.app.v4_relay_url)
@@ -1183,27 +1277,56 @@ class SettingsPanel(QFrame):
                     return False
                 relay_url = self._config_mgr.config.app.v4_relay_url
 
+        invalid_ranges = [
+            label for label, low, high in (
+                ("空战过载", self.gforce_min, self.gforce_max),
+                ("陆战速度", self.speed_min, self.speed_max),
+                ("CAS 过载", self.cas_gforce_min, self.cas_gforce_max),
+            ) if low.value() > high.value()
+        ]
+        if invalid_ranges and strict_connection:
+            # 手动保存：提示并中止，与波形页随机间隔的处理一致
+            QMessageBox.warning(
+                self, "触发设置",
+                "、".join(invalid_ranges) + " 的最小值不能大于最大值")
+            return False
+
         cfg = self._config_mgr.config
         ac = cfg.aircraft
         ac.enabled = self.ac_enabled.isChecked()
-        ac.gforce_min = self.gforce_min.value()
-        ac.gforce_max = self.gforce_max.value()
+        if "空战过载" not in invalid_ranges:
+            ac.gforce_min = self.gforce_min.value()
+            ac.gforce_max = self.gforce_max.value()
         ac.channel_a_max = self.ac_ch_a.value()
         ac.channel_b_max = self.ac_ch_b.value()
+        self._save_curve_controls("ac", ac)
 
         tank = cfg.tank
         tank.enabled = self.tank_enabled.isChecked()
-        tank.speed_min = self.speed_min.value()
-        tank.speed_max = self.speed_max.value()
+        if "陆战速度" not in invalid_ranges:
+            tank.speed_min = self.speed_min.value()
+            tank.speed_max = self.speed_max.value()
         tank.channel_a_max = self.tank_ch_a.value()
         tank.channel_b_max = self.tank_ch_b.value()
+        self._save_curve_controls("tank", tank)
+        tank.idle_enabled = self.tank_idle_enabled.isChecked()
+        tank.idle_speed_max = self.tank_idle_speed_max.value()
+        tank.idle_timeout_s = self.tank_idle_timeout.value()
+        tank.idle_ch_a = self.tank_idle_ch_a.value()
+        tank.idle_ch_b = self.tank_idle_ch_b.value()
 
         cas = cfg.cas
         cas.enabled = self.cas_enabled.isChecked()
-        cas.gforce_min = self.cas_gforce_min.value()
-        cas.gforce_max = self.cas_gforce_max.value()
+        if "CAS 过载" not in invalid_ranges:
+            cas.gforce_min = self.cas_gforce_min.value()
+            cas.gforce_max = self.cas_gforce_max.value()
+        if invalid_ranges:
+            # 静默保存（自动保存 / 关到托盘）：非法范围保留旧值，其余设置照常保存
+            logging.getLogger("MainWindow").warning(
+                "触发范围最小值大于最大值，保留旧值：%s", "、".join(invalid_ranges))
         cas.channel_a_max = self.cas_ch_a.value()
         cas.channel_b_max = self.cas_ch_b.value()
+        self._save_curve_controls("cas", cas)
 
         cfg.events.player_name = self.air_event_name.text().strip()
         self._save_event_controls("air_kill", cfg.events, "kill")
@@ -1214,6 +1337,8 @@ class SettingsPanel(QFrame):
         cfg.tank_events.repair_enabled = self.tank_repair_enabled.isChecked()
         cfg.tank_events.repair_ch_a = self.tank_repair_a.value()
         cfg.tank_events.repair_ch_b = self.tank_repair_b.value()
+        self._save_event_controls("tank_hit", cfg.tank_events, "hit")
+        cfg.tank_events.hit_cooldown = self.tank_hit_cooldown.value()
 
         cfg.app.ws_port = self._connection_widget.ws_port.value()
         cfg.app.dglab_protocol = protocol
@@ -1276,13 +1401,23 @@ class SettingsPanel(QFrame):
             self._appearance_changed()
 
     def _on_card_opacity_changed(self, value: int) -> None:
-        """拖动滑条时立即应用并保存卡片不透明度。"""
+        """拖动滑条时立即刷新卡片不透明度，防抖后保存。"""
         value = max(20, min(90, int(value)))
         self.card_opacity_value.setText(f"{value}%")
+        # 内存配置立即更新：退出时 _on_close 的 save() 也会写入最新值
         self._config_mgr.config.app.card_opacity = value
-        if self._appearance_changed:
+        if self._card_opacity_changed:
+            # 只改透明度，不重新扫描壁纸目录、不重建模糊缓存
+            self._card_opacity_changed(value)
+        elif self._appearance_changed:
             self._appearance_changed()
-        self._config_mgr.save()
+        self._opacity_save_timer.start()
+
+    def flush_pending_save(self) -> None:
+        """立即写入尚在防抖等待中的外观配置。"""
+        if self._opacity_save_timer.isActive():
+            self._opacity_save_timer.stop()
+            self._config_mgr.save()
 
     def _open_background_folder(self) -> None:
         """打开用户壁纸目录并刷新下拉选项。"""
@@ -1293,7 +1428,10 @@ class SettingsPanel(QFrame):
         self.background_combo.addItems(self._background_catalog.choices())
         self.background_combo.setCurrentText(current if current in self._background_catalog.choices() else "默认壁纸")
         self.background_combo.blockSignals(False)
-        self._background_catalog.ensure_directory()
+        if not self._background_catalog.ensure_directory():
+            QMessageBox.warning(self, "壁纸目录", "无法创建壁纸目录，程序目录可能不可写：\n"
+                                f"{self._background_catalog.directory}")
+            return
         if sys.platform == "win32":
             os.startfile(str(self._background_catalog.directory))
         else:
@@ -1325,7 +1463,8 @@ class SettingsPanel(QFrame):
         self.pages.show()
         self.modes.show()
         self.actions_widget.show()
-        self._load_config()
+        # 不重新载入配置：避免丢弃触发设置页尚未保存的修改；
+        # 回调只负责把波形页已保存的结果应用到控制器
         if self._on_save_callback:
             self._on_save_callback()
 
@@ -1335,7 +1474,7 @@ class WaveformSettingsDialog(QDialog):
 
     SCENES = {
         "aircraft": [("常规过载", "aircraft", False), ("击杀", "events", "kill"), ("被击落 / 坠毁", "events", "death")],
-        "tank": [("常规速度", "tank", False), ("CAS 过载", "cas", False), ("击杀", "tank_events", "kill"), ("被击毁", "tank_events", "death"), ("维修", "tank_events", "repair")],
+        "tank": [("常规速度", "tank", False), ("CAS 过载", "cas", False), ("击杀", "tank_events", "kill"), ("被击毁", "tank_events", "death"), ("维修", "tank_events", "repair"), ("被命中", "tank_events", "hit"), ("静止惩罚", "tank", "idle")],
     }
 
     def __init__(self, parent: QWidget, config_mgr: ConfigManager,
@@ -1381,14 +1520,33 @@ class WaveformSettingsDialog(QDialog):
         self._set_mode("aircraft")
 
     def _set_mode(self, mode: str) -> None:
-        if hasattr(self, "combo_a"):
-            self._commit_scene()
+        if hasattr(self, "combo_a") and not self._commit_scene():
+            # 当前场景的随机间隔非法：提示并恢复原模式按钮，不切换场景
+            self._warn_invalid_range()
+            self.air_button.setChecked(self._mode == "aircraft"); self.tank_button.setChecked(self._mode == "tank")
+            return
         self._mode = mode; self.air_button.setChecked(mode == "aircraft"); self.tank_button.setChecked(mode == "tank")
         self.scene_list.blockSignals(True); self.scene_list.clear(); self.scene_list.addItems([item[0] for item in self.SCENES[mode]]); self.scene_list.setCurrentRow(0); self.scene_list.blockSignals(False); self._scene_index = 0; self._load_scene()
 
     def _on_scene_changed(self, row: int) -> None:
-        if row >= 0:
-            self._commit_scene(); self._scene_index = row; self._load_scene()
+        if row < 0 or row == self._scene_index:
+            return
+        if not self._commit_scene():
+            # 提交失败时回滚列表选择，保留编辑器中的内容供用户修正
+            self._warn_invalid_range()
+            self.scene_list.blockSignals(True); self.scene_list.setCurrentRow(self._scene_index); self.scene_list.blockSignals(False)
+            return
+        self._scene_index = row; self._load_scene()
+
+    def _warn_invalid_range(self) -> None:
+        """提示随机间隔最小值大于最大值。"""
+        QMessageBox.warning(self, "波形设置", "随机间隔最小值不能大于最大值")
+
+    def commit_current_scene(self) -> bool:
+        """把编辑器中当前场景写入内存配置，供主窗口退出前静默保存。"""
+        if not hasattr(self, "combo_a"):
+            return True
+        return self._commit_scene()
 
     def _clear_editor(self) -> None:
         while self.editor_layout.count():
@@ -1435,7 +1593,7 @@ class WaveformSettingsDialog(QDialog):
         return True
 
     def _save(self) -> None:
-        if not self._commit_scene(): QMessageBox.warning(self, "波形设置", "随机间隔最小值不能大于最大值"); return
+        if not self._commit_scene(): self._warn_invalid_range(); return
         self._config_mgr.save()
         if self._on_saved: self._on_saved()
 
@@ -1444,7 +1602,10 @@ class WaveformSettingsDialog(QDialog):
         if result.errors: QMessageBox.warning(self, "波形刷新", "部分文件未加载：\n" + "\n".join(f"{n}: {e}" for n, e in result.errors))
 
     def _open_folder(self) -> None:
-        self._catalog.ensure_directory()
+        if not self._catalog.ensure_directory():
+            QMessageBox.warning(self, "波形目录", "无法创建波形目录，程序目录可能不可写：\n"
+                                f"{self._catalog.directory}")
+            return
         if sys.platform == "win32": os.startfile(str(self._catalog.directory))
         else: QFileDialog.getOpenFileName(self, "波形文件夹", str(self._catalog.directory))
 
@@ -1459,6 +1620,8 @@ class QRWidget(QFrame):
         self._qr_image_ref: QPixmap | None = None
         self._protocol = "v3"
         self._on_protocol_changed = on_protocol_changed
+        self.on_device_selected = None
+        self._device_items = None
         self._build()
 
     def _build(self) -> None:
@@ -1516,6 +1679,20 @@ class QRWidget(QFrame):
         status_layout.setSpacing(4)
         status_layout.addWidget(self.status_text)
         status_layout.addWidget(self.url_text)
+        self.device_selector = QComboBox()
+        self.device_selector.setObjectName("dglabDeviceSelector")
+        self.device_selector.setVisible(False)
+        self.device_selector.activated.connect(self._choose_device)
+        status_layout.addWidget(self.device_selector)
+        self.output_status = QLabel("")
+        self.output_status.setObjectName("dglabOutputStatus")
+        self.output_status.setWordWrap(True)
+        status_layout.addWidget(self.output_status)
+        # V3 WebSocket 服务监听所有网卡且无鉴权，提示仅在可信网络使用
+        self.lan_notice = QLabel("V3 服务对局域网开放，请仅在可信网络使用")
+        self.lan_notice.setObjectName("hintText")
+        self.lan_notice.setWordWrap(True)
+        status_layout.addWidget(self.lan_notice)
         layout.addWidget(status_card)
 
         connection_card = GlassCard()
@@ -1580,6 +1757,64 @@ class QRWidget(QFrame):
         layout.addWidget(connection_card)
         layout.addStretch()
 
+    def _choose_device(self, index):
+        slot = self.device_selector.itemData(index)
+        if slot and self.on_device_selected:
+            self.on_device_selected(slot)
+
+    def set_connection_snapshot(self, snapshot):
+        """显示后台状态；上报未知不冒充蓝牙或归零确认。"""
+        import time
+        labels = {
+            "idle": "连接未启动", "starting": "正在启动连接…",
+            "waiting_app": "等待手机扫码连接…", "waiting_device": "App 已接入，等待设备…",
+            "waiting_selection": "请选择郊狼设备", "initializing": "正在初始化归零…",
+            "ready": "已就绪", "recovering": "停止待确认／正在恢复…",
+            "stopping": "正在停止…", "error": "连接或输出异常",
+        }
+        self.set_status(labels.get(snapshot.state, snapshot.state), snapshot.error or snapshot.address)
+        self.qr_frame.setVisible(not snapshot.bound)
+        items = tuple((d.slot_id, d.name, d.available) for d in snapshot.devices)
+        key = (items, snapshot.selected_device)
+        if key != self._device_items:
+            self._device_items = key
+            self.device_selector.blockSignals(True)
+            self.device_selector.clear()
+            self.device_selector.addItem("请选择设备", "")
+            for slot, name, available in items:
+                self.device_selector.addItem(name + ("" if available else "（离线）"), slot)
+                item = self.device_selector.model().item(self.device_selector.count() - 1)
+                item.setEnabled(available)
+            selected = self.device_selector.findData(snapshot.selected_device)
+            self.device_selector.setCurrentIndex(max(0, selected))
+            self.device_selector.blockSignals(False)
+        self.device_selector.setVisible(
+            self._protocol == "v4"
+            and (len(items) > 1 or snapshot.state == "waiting_selection"))
+        lines = []
+        for name, ch in (("A", snapshot.a), ("B", snapshot.b)):
+            report = "未知" if ch.reported is None else str(ch.reported)
+            age = (f"，{max(0, time.monotonic() - ch.reported_at):.1f}秒前"
+                   if ch.reported_at is not None else "")
+            flags = []
+            if ch.muted:
+                flags.append("App 静音")
+            if ch.limit is not None:
+                flags.append(f"App 上限 {ch.limit}")
+            if ch.pending_stop:
+                flags.append("停止待确认" if self._protocol == "v4" else "停止待发送")
+            if ch.error:
+                flags.append(ch.error)
+            lines.append(f"{name} 目标 {ch.target} · App {report}{age}" +
+                         ("\n" + "；".join(flags) if flags else ""))
+        if self._protocol == "v3":
+            lines.append("V3 不提供蓝牙连接确认")
+        self.output_status.setText("\n".join(lines))
+        self.output_status.setMinimumHeight(max(
+            self.output_status.fontMetrics().height() * sum(line.count("\n") + 1 for line in lines),
+            self.output_status.heightForWidth(max(1, self.output_status.width())),
+        ))
+
     def set_protocol(self, protocol: str) -> None:
         """切换 V3/V4 设置项的显示状态。"""
         is_v4 = protocol == "v4"
@@ -1590,6 +1825,7 @@ class QRWidget(QFrame):
         self.ws_port.setVisible(not is_v4)
         self.relay_label.setVisible(is_v4)
         self.v4_relay_url.setVisible(is_v4)
+        self.lan_notice.setVisible(not is_v4)
 
     def get_protocol(self) -> str:
         """返回当前选择的 DG-LAB App 协议。"""
@@ -1697,6 +1933,7 @@ class MainWindow(QMainWindow):
             dashboard_widget=self.dashboard,
             appearance_changed=self._apply_appearance,
             background_catalog=self._background_catalog,
+            card_opacity_changed=self.backdrop.set_card_opacity,
         )
         self.dashboard.set_mode_callback(self._on_dashboard_mode_changed)
         splitter.addWidget(self.dashboard)
@@ -1778,9 +2015,18 @@ class MainWindow(QMainWindow):
 
     def save_current_settings(self) -> bool:
         """静默保存界面当前设置，自动保存时保留无效 Relay 旧值。"""
+        return self._save_settings_silently(notify=False)
+
+    def _save_settings_silently(self, notify: bool) -> bool:
+        """先提交波形页当前场景，再静默保存触发设置。"""
+        self.settings_panel.flush_pending_save()
+        waveform_view = getattr(self.settings_panel, "_waveform_view", None)
+        if waveform_view is not None and not waveform_view.commit_current_scene():
+            logging.getLogger("MainWindow").warning(
+                "波形页当前场景随机间隔非法，本次未写入该场景")
         return self.settings_panel.save_settings(
             show_feedback=False,
-            notify=False,
+            notify=notify,
             strict_connection=False,
         )
 
@@ -1920,7 +2166,7 @@ class MainWindow(QMainWindow):
             self._request_exit()
             return
 
-        self.save_current_settings()
+        self._save_settings_silently(notify=True)
         event.ignore()
         self.hide()
         if not self._tray_notice_shown:

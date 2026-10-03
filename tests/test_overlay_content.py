@@ -82,14 +82,14 @@ def test_set_content_flags_hides_overlay_widgets():
     assert overlay.mode_label.isVisibleTo(overlay)
     assert overlay.a_label.isVisibleTo(overlay)
     assert not overlay.b_label.isVisibleTo(overlay)
-    overlay.destroy()
+    overlay.dispose()
 
 
 def test_update_hides_metric_rows_without_data():
     """指标行可见性 = 开关 且 该指标有数据；空文本隐藏对应行。"""
     overlay = OverlayWindow()
 
-    overlay.update("aircraft", "3.5", "", 120, 80, "挥鞭.pulse", "恒定", "")
+    overlay.update_values("aircraft", "3.5", "", 120, 80, "挥鞭.pulse", "恒定", "")
     assert overlay.g_row.isVisibleTo(overlay)
     assert not overlay.speed_row.isVisibleTo(overlay)
     assert overlay.g_value_label.text() == "3.5"
@@ -99,7 +99,7 @@ def test_update_hides_metric_rows_without_data():
     # 开关关闭时即使有数据也不显示
     overlay.set_content_flags({"gforce": False})
     assert not overlay.g_row.isVisibleTo(overlay)
-    overlay.destroy()
+    overlay.dispose()
 
 
 def test_update_only_rewrites_changed_fields():
@@ -114,14 +114,14 @@ def test_update_only_rewrites_changed_fields():
 
     overlay.a_label.setText = spy_set_text
 
-    overlay.update("aircraft", "2.0", "", 100, 100, "恒定", "恒定", "")
+    overlay.update_values("aircraft", "2.0", "", 100, 100, "恒定", "恒定", "")
     calls.clear()
-    overlay.update("aircraft", "2.0", "", 100, 100, "恒定", "恒定", "")
+    overlay.update_values("aircraft", "2.0", "", 100, 100, "恒定", "恒定", "")
     assert calls == []
 
-    overlay.update("aircraft", "2.0", "", 101, 100, "恒定", "恒定", "")
+    overlay.update_values("aircraft", "2.0", "", 101, 100, "恒定", "恒定", "")
     assert calls == ["A: 101"]
-    overlay.destroy()
+    overlay.dispose()
 
 
 def test_sync_overlay_shows_only_mode_trigger_metric():
@@ -138,7 +138,7 @@ def test_sync_overlay_shows_only_mode_trigger_metric():
         app._event_mode = ""
         app._overlay_last_g = last_g
         app._overlay_last_speed = last_speed
-        app.overlay = SimpleNamespace(visible=True, update=Mock())
+        app.overlay = SimpleNamespace(visible=True, update_values=Mock())
         return app
 
     air_state = GameState(
@@ -148,7 +148,7 @@ def test_sync_overlay_shows_only_mode_trigger_metric():
     )
     app = make_app(air_state)
     app._sync_overlay("aircraft", 50, 40)
-    app.overlay.update.assert_called_once_with(
+    app.overlay.update_values.assert_called_once_with(
         "aircraft", "2.5", "", 50, 40, "恒定", "恒定", "")
     assert app._overlay_last_speed == ""
 
@@ -159,7 +159,7 @@ def test_sync_overlay_shows_only_mode_trigger_metric():
     )
     app = make_app(ground_state)
     app._sync_overlay("tank", 30, 20)
-    app.overlay.update.assert_called_once_with(
+    app.overlay.update_values.assert_called_once_with(
         "tank", "", "45", 30, 20, "恒定", "恒定", "")
 
     cas_state = GameState(
@@ -170,7 +170,7 @@ def test_sync_overlay_shows_only_mode_trigger_metric():
     app = make_app(cas_state, last_speed="68")
     app._sync_overlay("tank", 20, 10)
     # CAS 只显示过载，且陆战期间的速度值不得残留
-    app.overlay.update.assert_called_once_with(
+    app.overlay.update_values.assert_called_once_with(
         "tank", "1.8", "", 20, 10, "恒定", "恒定", "")
     assert app._overlay_last_speed == ""
 
@@ -193,12 +193,12 @@ def test_sync_overlay_reuses_last_value_only_within_context():
     app._event_mode = ""
     app._overlay_last_g = "2.1"
     app._overlay_last_speed = "55"
-    app.overlay = SimpleNamespace(visible=True, update=Mock())
+    app.overlay = SimpleNamespace(visible=True, update_values=Mock())
 
     app._sync_overlay("aircraft", 0, 0)
 
     # 空中沿用过载，速度缓存不跨上下文泄漏
-    app.overlay.update.assert_called_once_with(
+    app.overlay.update_values.assert_called_once_with(
         "aircraft", "2.1", "", 0, 0, "恒定", "恒定", "")
     assert app._overlay_last_speed == ""
 
@@ -216,15 +216,15 @@ def test_sync_overlay_shows_placeholder_when_not_in_battle():
     app._event_mode = ""
     app._overlay_last_g = ""
     app._overlay_last_speed = ""
-    app.overlay = SimpleNamespace(visible=True, update=Mock())
+    app.overlay = SimpleNamespace(visible=True, update_values=Mock())
 
     app._sync_overlay("aircraft", 0, 0)
-    app.overlay.update.assert_called_once_with(
+    app.overlay.update_values.assert_called_once_with(
         "aircraft", "--", "", 0, 0, "恒定", "恒定", "")
 
-    app.overlay.update.reset_mock()
+    app.overlay.update_values.reset_mock()
     app._sync_overlay("tank", 0, 0)
-    app.overlay.update.assert_called_once_with(
+    app.overlay.update_values.assert_called_once_with(
         "tank", "", "--", 0, 0, "恒定", "恒定", "")
 
 
@@ -345,4 +345,4 @@ def test_right_click_menu_contains_content_entry():
 
     assert seen == [True]
     menu.close()
-    overlay.destroy()
+    overlay.dispose()

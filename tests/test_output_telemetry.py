@@ -127,4 +127,4 @@ def test_snapshot_is_safe_during_concurrent_recording():
         thread.join()
 
     assert not errors
-    assert len(telemetry.snapshot("A").batches) == 40
+    assert len(telemetry.snapshot("A").batches) == 240

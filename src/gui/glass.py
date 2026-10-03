@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Optional
@@ -12,6 +13,8 @@ from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import QFrame, QWidget
 
 from ..runtime_paths import application_directory, resource_path
+
+logger = logging.getLogger(__name__)
 
 
 SUPPORTED_BACKGROUND_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
@@ -42,17 +45,28 @@ class BackgroundCatalog:
         self._files: dict[str, Path] = {}
         self.reload()
 
-    def ensure_directory(self) -> None:
-        """创建用户壁纸目录。"""
-        self.directory.mkdir(parents=True, exist_ok=True)
+    def ensure_directory(self) -> bool:
+        """创建用户壁纸目录；目录不可写（如程序放在只读位置）时返回 False。"""
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            logger.warning("无法创建壁纸目录 %s：%s", self.directory, error)
+            return False
+        return True
 
     def reload(self) -> tuple[str, ...]:
-        """扫描有效静态壁纸并返回文件名。"""
-        self.ensure_directory()
+        """扫描有效静态壁纸并返回文件名；目录不可用时只保留默认壁纸。"""
         files: dict[str, Path] = {}
-        for path in sorted(self.directory.iterdir(), key=lambda item: item.name.casefold()):
-            if path.is_file() and path.suffix.casefold() in SUPPORTED_BACKGROUND_EXTENSIONS:
-                files[path.name] = path
+        if self.ensure_directory():
+            try:
+                entries = sorted(self.directory.iterdir(),
+                                 key=lambda item: item.name.casefold())
+            except OSError as error:
+                logger.warning("无法读取壁纸目录 %s：%s", self.directory, error)
+                entries = []
+            for path in entries:
+                if path.is_file() and path.suffix.casefold() in SUPPORTED_BACKGROUND_EXTENSIONS:
+                    files[path.name] = path
         self._files = files
         return tuple(files)
 

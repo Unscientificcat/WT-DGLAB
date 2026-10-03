@@ -53,6 +53,8 @@ class TankData:
     speed_kmh: float = 0.0           # 当前速度 (km/h)
     is_repairing: bool = False       # 是否维修中
     repair_time: float = 0.0         # 剩余维修秒数
+    crew_alive: Optional[bool] = None  # 乘员是否存活（None=未知，字段缺失时不判定）
+    damaged_parts: frozenset = field(default_factory=frozenset)  # 已损毁部件/乘员名集合
 
 
 @dataclass
@@ -66,6 +68,7 @@ class GameState:
     raw_state: dict = field(default_factory=dict)
     raw_indicators: dict = field(default_factory=dict)
     raw_map_info: dict = field(default_factory=dict)
+    sampled_at: float | None = None  # 后台采样完成时刻，跨 GUI 队列保持原始有效期
 
 
 # ============================================================
@@ -397,7 +400,7 @@ class GameReader:
         return data
 
     def _parse_tank(self, state_json: dict, indicators_json: dict) -> TankData:
-        """解析坦克状态 — 提取速度数据"""
+        """解析坦克状态 — 提取速度、乘员存活与部件损伤数据"""
         data = TankData()
         data.valid = bool(indicators_json.get("valid", False))
         data.vehicle_name = str(indicators_json.get("type", ""))
@@ -409,6 +412,20 @@ class GameReader:
             )
             data.repair_time = self._safe_float(
                 indicators_json.get("repair_time")
+            )
+            # 乘员存活信号：crew_current/crew_total 成对出现时，
+            # 当前乘员数为 0 视为被击毁；字段缺失时保持 None 不判定。
+            crew_total = self._safe_float(
+                indicators_json.get("crew_total"), 0.0)
+            if crew_total > 0:
+                crew_current = self._safe_float(
+                    indicators_json.get("crew_current"), crew_total)
+                data.crew_alive = crew_current > 0
+            # 部件/乘员损伤集合：供主控制器做帧间差分检测损伤边沿。
+            data.damaged_parts = frozenset(
+                part.name for part in self._extract_damage_from_indicators(
+                    indicators_json)
+                if part.is_destroyed
             )
 
         return data
@@ -488,25 +505,28 @@ class GameReader:
         for field in damage_fields:
             val = state_json[field]
             name = field.replace("_", " ").replace("health", "").strip()
-            part = self._parse_part_value(name, val)
+            part = self._parse_part_value(field, val, name)
             parts.append(part)
 
         return parts
 
-    def _parse_part_value(self, name: str, val) -> TankDamagePart:
+    def _parse_part_value(self, field: str, val,
+                          display_name: str | None = None) -> TankDamagePart:
         """将字段值解析为 TankDamagePart
 
+        field 为原始字段名（用于判断 _state 后缀），display_name 为显示名，
+        缺省时沿用字段名。
         _state 字段: 0 = 正常, 非0 = 损毁
         其他字段：bool, 比例 0-1, 或百分比 0-100
         """
-        part = TankDamagePart(name=name)
+        part = TankDamagePart(name=display_name or field)
 
         if isinstance(val, bool):
             part.is_destroyed = not val
             part.health = 0.0 if part.is_destroyed else 100.0
         elif isinstance(val, (int, float)):
             # _state 字段：0=完好，非0=损毁
-            if name.endswith("_state") or name.endswith("状态"):
+            if field.endswith("_state") or field.endswith("状态"):
                 part.is_destroyed = (abs(val) > 0.001)
                 part.health = 0.0 if part.is_destroyed else 100.0
             elif val <= 1.0 and val >= 0:

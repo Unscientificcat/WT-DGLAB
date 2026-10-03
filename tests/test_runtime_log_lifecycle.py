@@ -75,7 +75,7 @@ def test_cleanup_failure_does_not_skip_other_resources(tmp_path, monkeypatch):
         app._on_close()
         app.coyote.stop.assert_called()
         app.window.stop_runtime_log_view.assert_called_once()
-        app.overlay.destroy.assert_called_once()
+        app.overlay.dispose.assert_called_once()
         app.window.quit.assert_called_once()
         assert not app._shutdown_complete
         assert session.abnormal
@@ -83,3 +83,40 @@ def test_cleanup_failure_does_not_skip_other_resources(tmp_path, monkeypatch):
         assert session.path.exists()
     finally:
         session.finish()
+
+
+def test_shutdown_waits_share_one_deadline(monkeypatch):
+    """多个卡住的后台线程共享总等待时长，而非每个 13 秒（C5）。"""
+    import main
+    from src.runtime_logging import StrengthLogSummary
+
+    timeouts = []
+    now = [100.0]
+
+    class StuckThread:
+        name = "stuck"
+
+        def join(self, timeout=None):
+            # 每个线程实际等待 3 秒后仍未结束
+            timeouts.append(timeout)
+            now[0] += 3.0
+
+        def is_alive(self):
+            return True
+
+    monkeypatch.setattr(main.time, "monotonic", lambda: now[0])
+    app = main.App.__new__(main.App)
+    app._shutdown_started = False
+    app._stop_event = threading.Event()
+    app._running = True
+    app.window = Mock()
+    app.config_mgr = Mock()
+    app.coyote = Mock()
+    app._controllers = [app.coyote]
+    app._start_workers = [StuckThread(), StuckThread(), StuckThread()]
+    app._strength_summary = StrengthLogSummary()
+    app._scope_dialogs = {}
+    app.overlay = Mock()
+    monkeypatch.setattr(main, "mark_runtime_abnormal", lambda *_: None)
+    app._on_close()
+    assert timeouts == [5.0, 2.0, 0.0]

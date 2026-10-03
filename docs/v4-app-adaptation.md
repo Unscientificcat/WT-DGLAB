@@ -1,5 +1,9 @@
 # DG-LAB 4.x App Socket 适配开发文档
 
+## 当前实现（2026-09-30）
+
+阶段17已重构连接会话、设备状态、输出意图和连续帧调度；当前行为及实机验收以 [连接重构说明](connection-refactor.md) 为准。下面保留最初适配背景。
+
 ## 目标
 
 在保留现有 DG-LAB 3.x App 连接方式的前提下，为 WT-DGLAB 增加 DG-LAB 4.x App 的 V4 Socket 控制能力。用户可在右侧“连接郊狼”区域选择 V3 或 V4，现有战争雷霆读取、强度映射、事件检测和波形设置保持不变。
@@ -11,7 +15,7 @@
 - 官方 V4 Relay 控制方地址为 `wss://trex.dungeon-lab.cn/v4`；自建 Relay 默认监听 `ws://127.0.0.1:9998`。控制方地址末尾不能多加 `/`。
 - V4 配对链接格式：`https://dungeon-lab.cn/s/?v=1&action=socket&url=<编码后的 App WebSocket 地址>`。
 - V4 设备操作必须同时指定 App 的 `clientId`、设备的 `slotId` 和通道。
-- Python SDK `dglab-kit-python` 当前 GitHub 版本要求 Python 3.13+ 和 `websockets>=15.0.1`；截至本次实施时 PyPI 尚无可安装发行版。
+- Python SDK `dglab-kit-python` 当前 GitHub 版本要求 Python 3.13+ 和 `websockets>=15.0.1`。原适配阶段未使用 PyPI 发行版；本次未验证最新发行状态。
 
 参考资料：
 
@@ -34,9 +38,9 @@
 - 保留 `CoyoteController` 作为 V3 实现，新增 `CoyoteV4Controller`。
 - 两个控制器提供一致的公开接口：`start()`、`stop()`、`status`、`get_qrcode_url()`、强度设置、波形设置和 `clear_all()`。
 - 主控制器根据 `app.dglab_protocol` 创建对应实现，并在连接设置保存后按需切换。
-- V4 默认选择首个接入 App 的首个可用郊狼设备；App 或设备断开后立即将状态置为未绑定，不继续发送输出。
+- V4 使用首个接入 App；唯一候选设备自动选择，多个候选设备手选；当前设备断开不自动控制另一台。
 - 官方 Python SDK 与现有 V3 库的 `websockets` 版本要求互斥，因此 V4 控制器按官方 SDK 帧结构实现所需的最小 RPC 子集，同时继续固定 V3 的稳定依赖版本。
-- V4 强度采用绝对目标值语义：跟踪上一次已发送值，并使用归零或带正负值的强度增量达到目标值。
+- V4 强度采用绝对目标语义：以已完成请求维护命令基准，上报值独立保存；结果未知先清理归零，再恢复最新目标。
 - V4 波形继续复用项目现有波形播放器，将每个 100ms 脉冲转换为 SDK 接受的四帧频率/强度数据。
 - 不在桌面程序中内嵌 Relay；用户可使用官方 Relay 或自行部署官方 `dglab-websocket-server`。
 

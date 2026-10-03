@@ -1,6 +1,7 @@
 """战争雷霆 HUD 事件检测器。
 
 统一管理跨对局 HUD 游标、击杀/被击落文本匹配和维修边沿检测。
+被命中（部件损伤）由主控制器基于 /indicators 数据检测，不在此处。
 """
 
 import logging
@@ -73,6 +74,7 @@ class EventDetector:
         self._last_dmg_id = 0
         self._cursor_ready = False
         self._repair_active = False
+        self._diag_logged = 0
 
     @property
     def last_dmg_id(self) -> int:
@@ -175,7 +177,11 @@ class EventDetector:
 
     def _detect_hud_event(self, records: list, mode: str,
                           event_config) -> dict:
-        """从新增 HUD 文本中检测击杀和被击落。"""
+        """从新增 HUD 文本中检测击杀和被击落。
+
+        未分类但包含玩家昵称的损伤消息会以限频方式写入日志，
+        为后续词条校准收集真实样本。
+        """
         player_name = self._normalize(
             str(getattr(event_config, "player_name", ""))
         )
@@ -195,6 +201,11 @@ class EventDetector:
             elif kind == "death" and getattr(
                     event_config, "death_enabled", False):
                 result = self._build_event("death", mode, event_config)
+            elif kind == "" and self._diag_logged < 20:
+                self._diag_logged += 1
+                logger.info(
+                    "HUD 未分类损伤消息（诊断样本 %d/20，mode=%s）: %s",
+                    self._diag_logged, mode, message)
 
         return result
 
@@ -228,8 +239,11 @@ class EventDetector:
 
     @staticmethod
     def _build_event(kind: str, mode: str, event_config) -> dict:
-        """将匹配结果转换为主控制器使用的标准事件字典。"""
-        prefix = "kill" if kind == "kill" else "death"
+        """将匹配结果转换为主控制器使用的标准事件字典。
+
+        kind 为 "kill" / "death" / "hit"，对应配置字段 {kind}_ch_a 等。
+        """
+        prefix = kind
         return {
             "kind": kind,
             "mode": mode,

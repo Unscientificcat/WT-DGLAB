@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import time
+import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from .runtime_paths import application_directory
+
+logger = logging.getLogger(__name__)
 
 Pulse = tuple[tuple[int, int, int, int], tuple[int, int, int, int]]
 FREQUENCY_DATASET = tuple(list(range(10, 51)) + list(range(52, 81, 2)) + [85, 90, 95, 100] + list(range(110, 201, 10)) + [233, 266, 300, 333, 366, 400] + [450, 500, 550, 600] + [700, 800, 900, 1000])
@@ -161,16 +165,27 @@ class WaveformCatalog:
         self.directory = Path(directory or application_directory()) / "waveforms"
         self._definitions: dict[str, WaveformDefinition] = {}
 
-    def ensure_directory(self) -> None:
-        """创建波形目录。"""
-        self.directory.mkdir(parents=True, exist_ok=True)
+    def ensure_directory(self) -> bool:
+        """创建波形目录；目录不可写时返回 False。"""
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            logger.warning("无法创建波形目录 %s：%s", self.directory, error)
+            return False
+        return True
 
     def reload(self) -> ReloadResult:
-        """扫描并解析波形目录。"""
-        self.ensure_directory()
+        """扫描并解析波形目录；目录不可用时只保留"恒定"。"""
         definitions: dict[str, WaveformDefinition] = {}
         errors: list[tuple[str, str]] = []
-        for path in sorted(self.directory.glob("*.pulse"), key=lambda p: p.name.casefold()):
+        paths = []
+        if self.ensure_directory():
+            try:
+                paths = sorted(self.directory.glob("*.pulse"),
+                               key=lambda p: p.name.casefold())
+            except OSError as error:
+                logger.warning("无法读取波形目录 %s：%s", self.directory, error)
+        for path in paths:
             try:
                 pulses = parse_pulse_text(path.read_text(encoding="utf-8-sig"), path.name)
                 definitions[path.name] = WaveformDefinition(path.name, str(path), pulses)
@@ -197,6 +212,7 @@ class WaveformPlayer:
     """管理单个通道的恒定或自定义波形播放。"""
     def __init__(self, waveform: str = "恒定", catalog: WaveformCatalog | None = None):
         self._index = 0
+        self._started_at = None
         self._data: tuple[Pulse, ...] = ()
         self._name = "恒定"
         self._catalog = catalog
@@ -215,6 +231,7 @@ class WaveformPlayer:
         self._data = tuple(data or ())
         self._name = name if self._data else "恒定"
         self._index = 0
+        self._started_at = None
 
     def next_pulse(self) -> Optional[Pulse]:
         """获取下一帧并循环。"""
@@ -224,9 +241,19 @@ class WaveformPlayer:
         self._index = (self._index + 1) % len(self._data)
         return pulse
 
+    def pulse_at(self, at: float):
+        """按单调时钟读取 100ms 帧，不受命令频率或预充量影响。"""
+        if not self._data:
+            return None
+        if self._started_at is None:
+            self._started_at = at
+        index = max(0, int((at - self._started_at + 1e-7) / 0.1))
+        return self._data[index % len(self._data)]
+
     def reset(self) -> None:
         """重置播放位置。"""
         self._index = 0
+        self._started_at = None
 
     @property
     def is_constant(self) -> bool:

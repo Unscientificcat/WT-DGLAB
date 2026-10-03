@@ -24,19 +24,7 @@ from src.waveforms import WaveformCatalog
 _APP = QApplication.instance() or QApplication([])
 
 
-class FakeV4WebSocket:
-    """记录 V4 控制器发送内容的简易 WebSocket。"""
-
-    def __init__(self):
-        self.messages = []
-
-    async def send(self, message):
-        """记录一条出站消息。"""
-        self.messages.append(message)
-
-    async def close(self):
-        """记录关闭操作。"""
-        pass
+from v4_peer import V4Peer as FakeV4WebSocket
 
 
 class FakeV3Client:
@@ -73,7 +61,7 @@ def _write_waveform_file(tmp_path, name="测试波形.pulse"):
 async def test_v4_constant_strength_records_output_batch():
     """V4 恒定模式按强度下发批次，遥测记录最终幅度与波形名。"""
     controller = CoyoteV4Controller()
-    controller._websocket = FakeV4WebSocket()
+    controller._websocket = FakeV4WebSocket(controller)
     controller._client_id = "app-1"
     controller._slot_id = "slot-1"
     controller._status.bound = True
@@ -92,7 +80,7 @@ async def test_v4_constant_strength_records_output_batch():
 async def test_v4_zero_strength_records_silence():
     """V4 强度归零后遥测记录静默。"""
     controller = CoyoteV4Controller()
-    controller._websocket = FakeV4WebSocket()
+    controller._websocket = FakeV4WebSocket(controller)
     controller._client_id = "app-1"
     controller._slot_id = "slot-1"
     controller._status.bound = True
@@ -115,7 +103,7 @@ async def test_v4_preset_waveform_records_name_and_scaled_amplitudes(tmp_path):
     controller._set_waveform("A", "测试波形.pulse")
     assert controller.telemetry.snapshot("A").name == "测试波形.pulse"
 
-    controller._websocket = FakeV4WebSocket()
+    controller._websocket = FakeV4WebSocket(controller)
     controller._client_id = "app-1"
     controller._slot_id = "slot-1"
     controller._status.bound = True
@@ -140,7 +128,7 @@ async def test_v4_unknown_waveform_falls_back_to_constant():
 async def test_v4_reset_channel_records_silence():
     """V4 归零通道（重置）同样在遥测中记录静默。"""
     controller = CoyoteV4Controller()
-    controller._websocket = FakeV4WebSocket()
+    controller._websocket = FakeV4WebSocket(controller)
     controller._client_id = "app-1"
     controller._slot_id = "slot-1"
     controller._status.bound = True

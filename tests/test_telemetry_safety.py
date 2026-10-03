@@ -292,12 +292,12 @@ def test_overlay_never_reuses_a_value_after_telemetry_becomes_invalid():
     app._event_remaining = 0.0
     app._event_kind = ""
     app._event_mode = ""
-    app.overlay = SimpleNamespace(visible=True, update=Mock())
+    app.overlay = SimpleNamespace(visible=True, update_values=Mock())
 
     # 真实流程中 _apply_game_state 对局失效时以 (mode, 0, 0) 调用
     app._sync_overlay("tank", 0, 0)
 
-    app.overlay.update.assert_called_once_with(
+    app.overlay.update_values.assert_called_once_with(
         "tank", "", "--", 0, 0, "恒定", "恒定", "")
     assert app._overlay_last_g == ""
     assert app._overlay_last_speed == ""
@@ -401,8 +401,8 @@ def test_finished_kill_resumes_repair_when_tank_is_still_repairing():
     assert app._event_ch_a == 81
     assert app._event_ch_b == 42
     assert app._event_remaining == 60.0
-    app.coyote.set_waveform_a.assert_called_once_with("维修A")
-    app.coyote.set_waveform_b.assert_called_once_with("维修B")
+    app.coyote.set_waveform_a.assert_called_once_with("维修A", False, 30, 50)
+    app.coyote.set_waveform_b.assert_called_once_with("维修B", False, 30, 50)
     app.window.dashboard.show_event.assert_called_once_with("🔧 维修中")
     app._apply_waveform.assert_not_called()
 
@@ -410,6 +410,7 @@ def test_finished_kill_resumes_repair_when_tank_is_still_repairing():
 def test_finished_kill_returns_to_normal_when_repair_has_stopped():
     """击杀结束时已停止维修，应恢复常规映射而非维修输出。"""
     app = App.__new__(App)
+    app.coyote = SimpleNamespace(stop_output=Mock())
     app.config_mgr = SimpleNamespace(config=SimpleNamespace(
         tank_events=TankEventSettings(repair_enabled=True),
     ))

@@ -1,7 +1,7 @@
 """PySide6 悬浮窗，显示实时游戏数据，支持自定义显示内容。"""
 
-from PySide6.QtCore import QEventLoop, QPoint, Qt, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtCore import QEvent, QPoint, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -75,6 +75,10 @@ class OverlayWindow(QWidget):
         self._build()
         self.move(100, 100)
         self.hide()
+        # 显示器被拔除后把悬浮窗拉回仍存在的屏幕
+        app = QGuiApplication.instance()
+        if app is not None:
+            app.screenRemoved.connect(self._on_screen_removed)
 
     def _build(self) -> None:
         """创建悬浮窗控件。"""
@@ -152,6 +156,7 @@ class OverlayWindow(QWidget):
         """显示悬浮窗并清除显示缓存。"""
         self._visible = True
         self._cache = {key: "" for key in self._cache}
+        self.ensure_on_screen()
         super().show()
 
     def hide(self) -> None:
@@ -178,10 +183,7 @@ class OverlayWindow(QWidget):
                       self.speed_unit_label, self.event_label,
                       self.a_wave_label, self.b_wave_label):
             label.setStyleSheet(f"font-size:{mode}px;")
-        # styleSheet 触发的重布局事件是延迟投递的，先排除输入事件冲一遍布局，
-        # 否则 adjustSize 会按上一次的旧字号取尺寸，导致悬浮窗大小滞后一拍
-        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
-        self.adjustSize()
+        self._relayout_now()
 
     def get_value_font(self) -> int:
         """返回当前悬浮窗主字号（像素）。"""
@@ -199,7 +201,20 @@ class OverlayWindow(QWidget):
         self.a_wave_label.setVisible(self._flags["wave_a"])
         self.b_wave_label.setVisible(self._flags["wave_b"])
         self._refresh_metric_row_visibility()
-        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+        self._relayout_now()
+
+    def _relayout_now(self) -> None:
+        """同步重算布局后调整窗口尺寸。
+
+        styleSheet / 可见性变化触发的 LayoutRequest 是延迟投递的（且嵌套行
+        各有子布局缓存），直接 adjustSize 会按旧尺寸计算。这里只同步投递
+        本窗口及子控件的 LayoutRequest 事件（由内向外），不再调用
+        processEvents，避免在滑条回调中重入处理定时器、信号等其他事件。
+        """
+        widgets = self.findChildren(QWidget)
+        for widget in reversed(widgets):
+            QApplication.sendPostedEvents(widget, QEvent.Type.LayoutRequest)
+        QApplication.sendPostedEvents(self, QEvent.Type.LayoutRequest)
         self.adjustSize()
 
     def _refresh_metric_row_visibility(self) -> None:
@@ -208,7 +223,7 @@ class OverlayWindow(QWidget):
         self.speed_row.setVisible(
             self._flags["speed"] and bool(self._cache["speed"]))
 
-    def update(self, mode: str, g_text: str, speed_text: str, ch_a: int,
+    def update_values(self, mode: str, g_text: str, speed_text: str, ch_a: int,
                ch_b: int, wave_a: str = "", wave_b: str = "",
                event_text: str = "") -> None:
         """仅更新发生变化的实时字段，减少重绘。
@@ -245,8 +260,30 @@ class OverlayWindow(QWidget):
                 labels[key].setText(text)
         self._refresh_metric_row_visibility()
 
-    def destroy(self) -> None:
+    def ensure_on_screen(self) -> None:
+        """悬浮窗左上角不在任何屏幕可用区域内时移回主屏 (100, 100)。"""
+        screens = QGuiApplication.screens()
+        if not screens:
+            return
+        pos = self.pos()
+        if any(screen.availableGeometry().contains(pos) for screen in screens):
+            return
+        primary = QGuiApplication.primaryScreen() or screens[0]
+        area = primary.availableGeometry()
+        self.move(area.left() + 100, area.top() + 100)
+
+    def _on_screen_removed(self, _screen) -> None:
+        """屏幕移除后校正位置（Qt 发出信号时屏幕列表可能尚未更新）。"""
+        QTimer.singleShot(0, self.ensure_on_screen)
+
+    def dispose(self) -> None:
         """关闭并释放悬浮窗。"""
+        app = QGuiApplication.instance()
+        if app is not None:
+            try:
+                app.screenRemoved.disconnect(self._on_screen_removed)
+            except (RuntimeError, TypeError):
+                pass
         self._visible = False
         self.close()
         self.deleteLater()
