@@ -12,7 +12,9 @@
     "random_min_a": 30,
     "random_max_a": 50,
     "random_min_b": 30,
-    "random_max_b": 50
+    "random_max_b": 50,
+    "curve": "linear",
+    "curve_steepness": 2.0
   },
   "tank": {
     "enabled": true,
@@ -27,7 +29,18 @@
     "random_min_a": 30,
     "random_max_a": 50,
     "random_min_b": 30,
-    "random_max_b": 50
+    "random_max_b": 50,
+    "curve": "linear",
+    "curve_steepness": 2.0,
+    "idle_enabled": false,
+    "idle_timeout_s": 10.0,
+    "idle_speed_max": 2.0,
+    "idle_ch_a": 0,
+    "idle_ch_b": 0,
+    "idle_wf_a": "恒定",
+    "idle_wf_b": "恒定",
+    "idle_random_a": false,
+    "idle_random_b": false
   },
   "cas": {
     "enabled": true,
@@ -42,7 +55,9 @@
     "random_min_a": 30,
     "random_max_a": 50,
     "random_min_b": 30,
-    "random_max_b": 50
+    "random_max_b": 50,
+    "curve": "linear",
+    "curve_steepness": 2.0
   },
   "events": {
     "player_name": "",
@@ -87,7 +102,16 @@
     "death_random_a": false,
     "death_random_b": false,
     "repair_random_a": false,
-    "repair_random_b": false
+    "repair_random_b": false,
+    "hit_enabled": false,
+    "hit_ch_a": 0,
+    "hit_ch_b": 0,
+    "hit_duration": 0.5,
+    "hit_wf_a": "恒定",
+    "hit_wf_b": "恒定",
+    "hit_cooldown": 2.0,
+    "hit_random_a": false,
+    "hit_random_b": false
   },
   "app": {
     "ws_port": 8765,

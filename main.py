@@ -16,22 +16,26 @@ import logging
 import threading
 import queue
 import random
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import qrcode
 from PIL import Image
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from src.config_manager import ConfigManager
 from src.event_detector import EventDetector
 from src.game_reader import GameReader, GameState
+from src.connection_service import ConnectionService
+from src.dglab_state import ChannelTarget, OutputIntent, WaveformConfig
 from src.coyote_controller import CoyoteController
 from src.coyote_v4_controller import CoyoteV4Controller
 from src.waveforms import WaveformCatalog
 from src.mapping_engine import MappingEngine
 from src.gui.disclaimer_dialog import show_disclaimer_dialog
-from src.gui.main_window import MainWindow, OverlayContentDialog
+from src.gui.main_window import MainWindow, OverlayContentDialog, SAVE_DEBOUNCE_MS
 from src.gui.overlay import OverlayWindow, OVERLAY_CONTENT_FLAGS
 from src.gui.waveform_scope import ChannelScopeDialog
 from src.runtime_paths import application_directory, resource_path
@@ -68,19 +72,37 @@ def _load_config_manager() -> ConfigManager:
         )
         logger.info("未找到用户配置，将使用安全默认模板")
     if not config_exists:
-        manager.save()
-        logger.info(f"已生成默认配置: {config_path}")
+        try:
+            manager.save()
+            logger.info(f"已生成默认配置: {config_path}")
+        except OSError as error:
+            # 目录只读时继续以内存配置运行，窗口出现后再提示用户
+            manager.save_error = f"程序目录不可写，设置将无法保存：{error}"
+            logger.warning(manager.save_error)
     return manager
 
 
 class App:
     """应用主控制器 — 后台线程读取游戏数据，主线程只负责更新 GUI"""
 
+    # 旧接口兼容路径的保活间隔；主程序使用输出意图，波形由后台独立调度。
+    STRENGTH_KEEPALIVE_S = 0.5
+    # 退出时等待全部后台线程结束的总时长（秒）
+    SHUTDOWN_WAIT_S = 5.0
+    # UI 刷新节拍（秒），与 window.after(100, ...) 一致
+    UI_TICK_S = 0.1
+
+    # 死亡封锁解除所需持续移动帧数（约 1 秒）：
+    # 坦克被击毁瞬间的残留速度帧只有一两帧，不足以确认玩家真的在开动。
+    IDLE_UNBLOCK_FRAMES = 10
+
     def __init__(self):
         self._shutdown_complete = False
         self._shutdown_started = False
         self._stop_event = threading.Event()
         self._start_workers = []
+        # 协议 / 端口切换后待停止的旧控制器，由下一次启动线程先行停止
+        self._retiring_controllers = []
         self._controllers = []
         self._strength_summary = StrengthLogSummary()
         # ===== 配置 =====
@@ -95,13 +117,25 @@ class App:
         self._coyote_started = False
 
         # 事件输出状态
-        self._event_kind = ""       # "" / "kill" / "death" / "repair"
+        self._event_kind = ""       # "" / "kill" / "death" / "repair" / "hit"
         self._event_mode = ""       # "aircraft" / "tank"
         self._event_ch_a = 0
         self._event_ch_b = 0
         self._event_remaining = 0.0  # 剩余秒数
+        self._event_clock = None     # 上次倒计时的 time.monotonic()，按实际耗时扣减
         self._repair_blocked_until_idle = False
         self._repair_death_state = None
+        # 静止惩罚状态（仅陆战驾驶坦克时生效）
+        self._idle_active = False          # 静止惩罚输出中
+        self._idle_start_time = None       # 静止计时起点 (time.monotonic 秒)
+        self._idle_label_shown = False     # 仪表盘静止提示显示中
+        self._idle_death_blocked = False   # 死亡封锁：复活后首次移动才解除
+        self._idle_move_frames = 0         # 死亡封锁解除的持续移动帧计数
+        # 部件损伤短脉冲状态
+        # 上一帧已损毁部件集合；None 表示基线未知（启动 / 离开陆战地面后），
+        # 下一有效坦克帧只建立基线不触发
+        self._last_damaged_parts = None
+        self._last_hit_time = 0.0          # 上次部件损伤触发时间（冷却用）
         self._current_mode = self._cfg.app.mode
         self._wt_fail_count = 0
         self._wt_connected = False
@@ -149,6 +183,11 @@ class App:
         self._coyote_protocol = self._cfg.app.dglab_protocol
         self.coyote = self._create_coyote_controller()
         self._controllers.append(self.coyote)
+        self._connection_service = ConnectionService(self.coyote)
+        self._desired_waveforms = {"A": WaveformConfig(), "B": WaveformConfig()}
+        self._output_revision = 0
+        self._last_connection_session = None
+        self.window.qr_widget.on_device_selected = self._select_coyote_device
 
         # ===== 线程间通信 =====
         self._data_queue = queue.Queue(maxsize=2)  # 只保留最新游戏数据
@@ -171,13 +210,19 @@ class App:
         # 先将主窗口带到前台，避免模态注意事项附着在隐藏父窗口上。
         self.window.show_startup()
 
+        # 配置文件有字段被修正时提示一次，说明原文件备份位置
+        self._show_config_issues()
+
         # 首次启动显示注意事项
         if not self._cfg.app.notice_accepted:
             if not self._show_disclaimer_dialog():
                 self._on_close()
                 return  # 用户关闭对话框则退出
             self._cfg.app.notice_accepted = True
-            self.config_mgr.save()
+            try:
+                self.config_mgr.save()
+            except OSError as error:
+                logger.warning("保存注意事项确认状态失败：%s", error)
 
         # 启动游戏数据后台线程
         self._poller_thread = threading.Thread(
@@ -197,6 +242,25 @@ class App:
         # 进入 Qt 主循环
         self.window.run()
 
+    def _show_config_issues(self) -> None:
+        """启动时若配置有字段被恢复默认，弹窗列出修正项与备份文件。"""
+        save_error = getattr(self.config_mgr, "save_error", "")
+        if save_error:
+            QMessageBox.warning(self.window, "无法保存设置", save_error)
+        issues = self.config_mgr.load_issues
+        if not issues:
+            return
+        shown = issues[:10]
+        lines = ["以下配置无效，已恢复默认值："]
+        lines += [f"• {issue}" for issue in shown]
+        if len(issues) > len(shown):
+            lines.append(f"……另有 {len(issues) - len(shown)} 项，详见日志")
+        backup = self.config_mgr.invalid_backup_path
+        lines.append("")
+        lines.append(f"原配置文件已备份到：\n{backup}" if backup
+                     else "原配置文件备份失败，详见日志")
+        QMessageBox.warning(self.window, "配置已修正", "\n".join(lines))
+
     def _on_close(self):
         """托盘退出回调 — 保存配置并清理后台资源。"""
         if self._shutdown_started:
@@ -215,10 +279,20 @@ class App:
                 clean = False
                 logger.exception("退出清理失败：%s", label)
 
+        save_timer = getattr(self, "_config_save_timer", None)
+        if save_timer is not None:
+            save_timer.stop()
         cleanup(self.window.save_current_settings, "保存界面设置")
         cleanup(self.config_mgr.save, "保存配置")
         # 优先归零当前设备，单项清理失败不能阻止其他资源停止。
-        cleanup(self.coyote.stop, "停止当前控制器")
+        deadline = time.monotonic() + self.SHUTDOWN_WAIT_S
+        service = getattr(self, "_connection_service", None)
+        if service is not None:
+            if not service.stop(max(0.0, deadline - time.monotonic())):
+                clean = False
+                logger.error("郊狼连接会话未能在退出期限内结束")
+        else:
+            cleanup(self.coyote.stop, "停止当前控制器")
         diagnostics = getattr(self, "_connection_diagnostics", None)
         if diagnostics is not None and not diagnostics.stop():
             clean = False
@@ -228,18 +302,24 @@ class App:
         poller = getattr(self, "_poller_thread", None)
         if poller is not None:
             workers.append(poller)
+        # 所有后台线程共享一个总截止时间，避免逐个等待累计十几秒以上
+        if service is None:
+            deadline = time.monotonic() + self.SHUTDOWN_WAIT_S
         for worker in workers:
-            cleanup(lambda worker=worker: worker.join(timeout=13), "等待后台线程")
+            remaining = max(0.0, deadline - time.monotonic())
+            cleanup(lambda worker=worker, remaining=remaining:
+                    worker.join(timeout=remaining), "等待后台线程")
             if worker.is_alive():
                 clean = False
                 logger.error("后台线程未能结束：%s", worker.name)
         # 启动线程可能在第一次停止后才创建控制循环，等待后再次清理。
-        for controller in self._controllers:
-            cleanup(controller.stop, "停止控制器")
+        if service is None:
+            for controller in self._controllers:
+                cleanup(controller.stop, "停止控制器")
         cleanup(self._strength_summary.flush, "记录最后强度变化")
         for dialog in self._scope_dialogs.values():
             cleanup(dialog.close, "关闭波形窗口")
-        cleanup(self.overlay.destroy, "关闭悬浮窗")
+        cleanup(self.overlay.dispose, "关闭悬浮窗")
         if not clean:
             mark_runtime_abnormal("退出清理未完成")
         self._shutdown_complete = clean
@@ -272,6 +352,7 @@ class App:
             self._connection_diagnostics.observe(state.link_ok)
 
             # 游戏数据入队
+            state.sampled_at = time.monotonic()
             try:
                 self._data_queue.put(state, block=False)
             except queue.Full:
@@ -301,6 +382,9 @@ class App:
             if not event:
                 return
 
+            if hasattr(self, "_connection_service"):
+                event["_connection_session"] = (id(self.coyote), self.coyote.snapshot().session)
+                event["_created_at"] = time.monotonic()
             logger.info(
                 f"检测到事件: {event['kind']} mode={event.get('mode', '')}"
             )
@@ -326,6 +410,8 @@ class App:
     def _ui_tick(self):
         """主线程定时器 — 检查数据队列并更新 UI"""
         try:
+            if hasattr(self, "_connection_service"):
+                self._update_coyote_status()
             # 1. 先取最新遥测，死亡事件以本轮状态为基线，不能用它解除限制。
             state = None
             try:
@@ -335,6 +421,8 @@ class App:
                 pass
             if state is not None:
                 self._last_state = state
+                self._last_telemetry_at = (
+                    state.sampled_at if state.sampled_at is not None else time.monotonic())
 
             # 2. 取后台检测的事件
             try:
@@ -355,7 +443,7 @@ class App:
 
             # 4. 事件倒计时
             if self._event_remaining > 0:
-                self._event_remaining -= 0.1
+                self._event_remaining -= self._event_elapsed()
                 if self._event_remaining <= 0:
                     self._finish_active_event()
                     # 到期当轮即下发恢复后的强度，不能等下一帧遥测。
@@ -365,6 +453,10 @@ class App:
                 elif self._event_kind == "kill":
                     self.window.dashboard.show_event(
                         f"⚔ 击杀! ({self._event_remaining:.1f}s)"
+                    )
+                elif self._event_kind == "hit":
+                    self.window.dashboard.show_event(
+                        f"🎯 被命中! ({self._event_remaining:.1f}s)"
                     )
                 else:
                     text = (
@@ -376,7 +468,8 @@ class App:
 
             # 5. 更新郊狼状态
             self._process_coyote_start_result()
-            self._update_coyote_status()
+            if not hasattr(self, "_connection_service"):
+                self._update_coyote_status()
 
             # 6. 同步当前输出波形名到仪表盘通道卡
             self._update_channel_wave_names()
@@ -425,6 +518,9 @@ class App:
             if self.coyote.status.bound:
                 self._send_strength(0, 0)
             self._cancel_active_event()
+            self._reset_idle_penalty()
+            self._last_damaged_parts = None
+            self._idle_death_blocked = False
             self.window.dashboard.clear(mode)
             self._overlay_last_g = ""
             self._overlay_last_speed = ""
@@ -443,6 +539,18 @@ class App:
         if self._event_kind == "repair" and not self._repair_is_active(state):
             self._cancel_active_event("维修已结束、失效或关闭，取消维修输出")
 
+        # 陆战地面上下文：部件损伤边沿检测 + 静止惩罚状态机。
+        # 事件覆盖期间计时继续，输出优先级低于事件；
+        # 非陆战地面上下文（机库/空战/CAS/数据无效）一律重置。
+        if (mode == "tank" and state.vehicle_type == "tank"
+                and state.tank and state.tank.valid):
+            self._update_part_damage(state.tank)
+            self._update_idle_penalty(state.tank, cfg.tank)
+        else:
+            self._reset_idle_penalty()
+            # 离开陆战地面（机库/空战/CAS/数据无效）后旧基线不可信
+            self._last_damaged_parts = None
+
         # 事件覆盖：击杀/被击落期间用事件强度替代 G 值映射
         if self._event_remaining > 0:
             intensity_a = self._event_ch_a
@@ -451,6 +559,8 @@ class App:
                 label = "⚔ 击杀!"
             elif self._event_kind == "death":
                 label = "💀 坠毁!" if self._event_mode == "aircraft" else "💀 被摧毁!"
+            elif self._event_kind == "hit":
+                label = "🎯 被命中!"
             else:
                 label = "🔧 维修中"
             self.window.dashboard.update_event(
@@ -463,7 +573,8 @@ class App:
             if ac_cfg.enabled:
                 intensity_a, intensity_b = MappingEngine.map_aircraft(
                     ac.gforce, ac_cfg.gforce_min, ac_cfg.gforce_max,
-                    ac_cfg.channel_a_max, ac_cfg.channel_b_max)
+                    ac_cfg.channel_a_max, ac_cfg.channel_b_max,
+                    curve=ac_cfg.curve, steepness=ac_cfg.curve_steepness)
             self.window.dashboard.update_aircraft(
                 ac.gforce, intensity_a, intensity_b)
 
@@ -477,21 +588,38 @@ class App:
                     self._set_normal_waveforms(cas_cfg)
                     intensity_a, intensity_b = MappingEngine.map_aircraft(
                         ac.gforce, cas_cfg.gforce_min, cas_cfg.gforce_max,
-                        cas_cfg.channel_a_max, cas_cfg.channel_b_max)
+                        cas_cfg.channel_a_max, cas_cfg.channel_b_max,
+                        curve=cas_cfg.curve,
+                        steepness=cas_cfg.curve_steepness)
                 self.window.dashboard.update_aircraft(
                     ac.gforce, intensity_a, intensity_b)
             elif state.vehicle_type == "tank" and state.tank and state.tank.valid:
-                # 在地面 → 速度触发
+                # 在地面 → 速度触发（静止惩罚生效时持续输出惩罚强度）
                 tk_data = state.tank
                 tk_cfg = cfg.tank
-                self._set_normal_waveforms(tk_cfg)
-                if tk_cfg.enabled:
-                    intensity_a, intensity_b = MappingEngine.map_tank(
-                        tk_data.speed_kmh,
-                        tk_cfg.speed_min, tk_cfg.speed_max,
-                        tk_cfg.channel_a_max, tk_cfg.channel_b_max)
+                idle_active = getattr(self, "_idle_active", False)
+                label_shown = getattr(self, "_idle_label_shown", False)
+                if idle_active:
+                    self._set_idle_waveforms(tk_cfg)
+                    intensity_a = tk_cfg.idle_ch_a
+                    intensity_b = tk_cfg.idle_ch_b
+                    if not label_shown:
+                        self._idle_label_shown = True
+                        self.window.dashboard.show_event("🛑 静止超时，请移动!")
                 else:
-                    intensity_a, intensity_b = 0, 0
+                    if label_shown:
+                        self._idle_label_shown = False
+                        self.window.dashboard.show_event("")
+                    self._set_normal_waveforms(tk_cfg)
+                    if tk_cfg.enabled:
+                        intensity_a, intensity_b = MappingEngine.map_tank(
+                            tk_data.speed_kmh,
+                            tk_cfg.speed_min, tk_cfg.speed_max,
+                            tk_cfg.channel_a_max, tk_cfg.channel_b_max,
+                            curve=tk_cfg.curve,
+                            steepness=tk_cfg.curve_steepness)
+                    else:
+                        intensity_a, intensity_b = 0, 0
                 self.window.dashboard.update_tank(
                     tk_data.speed_kmh, intensity_a, intensity_b)
             else:
@@ -510,6 +638,19 @@ class App:
             self._overlay_tick = 0
             self._sync_overlay(mode, intensity_a, intensity_b)
 
+    def _event_elapsed(self) -> float:
+        """返回本轮倒计时应扣减的秒数：实际经过时间，至少一个 UI 节拍。
+
+        GUI 被拖动窗口 / 模态对话框阻塞时节拍会远大于 100ms，按实际耗时扣减，
+        避免事件输出比配置时长更久；正常节拍仍按 0.1 秒扣减。
+        """
+        now = time.monotonic()
+        last = getattr(self, "_event_clock", None)
+        self._event_clock = now
+        if last is None:
+            return self.UI_TICK_S
+        return max(self.UI_TICK_S, now - last)
+
     def _cancel_active_event(self, reason: str =
                              "已离开有效对局，取消事件输出并恢复常规波形"):
         """取消事件覆盖并记录原因，避免事件强度继续输出。"""
@@ -519,9 +660,15 @@ class App:
         self._event_ch_a = 0
         self._event_ch_b = 0
         self._event_remaining = 0.0
+        self._event_clock = None
         self.window.dashboard.show_event("")
 
         if had_event:
+            # 先停止旧事件输出，再提交恢复波形和强度。
+            stop_output = getattr(self.coyote, "stop_output", None)
+            if callable(stop_output):
+                stop_output()
+            self._strength_sent = None
             self._overlay_tick = 1
             self._apply_waveform()
             logger.info(reason)
@@ -531,29 +678,59 @@ class App:
         if ev["kind"] == "death" and ev["mode"] == "tank":
             self._repair_blocked_until_idle = True
             self._repair_death_state = self._last_state
+            # 死亡后立即结束静止惩罚并封锁，防止选车界面残留的
+            # 有效坦克帧（速度 0）继续触发惩罚；复活后首次移动解除。
+            self._reset_idle_penalty()
+            self._idle_death_blocked = True
             logger.info("坦克被击毁，作废旧维修并等待有效非维修状态")
         elif ev["kind"] == "repair":
             if (getattr(self, "_repair_blocked_until_idle", False)
                     or (self._event_kind in {"kill", "death"}
                         and self._event_remaining > 0)):
                 return
+        elif ev["kind"] == "hit":
+            # 被命中短脉冲优先级最低：不打断进行中的击杀/坠毁/维修事件，
+            # 也不在死亡等待重生期间输出。
+            if (self._event_remaining > 0
+                    or getattr(self, "_repair_blocked_until_idle", False)):
+                logger.info("被命中短脉冲被更高优先级输出抑制")
+                return
+        if hasattr(self, "_connection_service"):
+            snap = self.coyote.snapshot()
+            origin = ev.get("_connection_session", (id(self.coyote), snap.session))
+            if not snap.bound or origin != (id(self.coyote), snap.session):
+                logger.info("丢弃未连接期间或旧会话的事件输出: %s", ev["kind"])
+                return
+            age = time.monotonic() - ev.get("_created_at", time.monotonic())
+            if ev["kind"] != "repair" and age >= ev["duration"]:
+                return
+        # 接受新事件时先停旧输出，避免新波形短暂使用旧的较高强度。
+        stop_output = getattr(self.coyote, "stop_output", None)
+        if callable(stop_output):
+            stop_output()
+        self._strength_sent = None
         self._event_kind = ev["kind"]
         self._event_mode = ev["mode"]
         self._event_ch_a = ev["ch_a"]
         self._event_ch_b = ev["ch_b"]
         self._event_remaining = ev["duration"]
+        self._event_deadline = ev.get("_created_at", time.monotonic()) + ev["duration"]
+        self._output_revision = getattr(self, "_output_revision", 0) + 1
+        self._event_clock = time.monotonic()
         cfg = self._cfg.events if ev["mode"] == "aircraft" else self._cfg.tank_events
         kind = ev["kind"]
         catalog = getattr(self, "waveform_catalog", None)
         choices = [name for name in catalog.choices() if name != "恒定"] if catalog else []
         wf_a = random.choice(choices) if getattr(cfg, f"{kind}_random_a", False) and choices else ev["wf_a"]
         wf_b = random.choice(choices) if getattr(cfg, f"{kind}_random_b", False) and choices else ev["wf_b"]
-        self.coyote.set_waveform_a(wf_a)
-        self.coyote.set_waveform_b(wf_b)
+        self._set_output_waveform("A", wf_a)
+        self._set_output_waveform("B", wf_b)
         if ev["kind"] == "kill":
             label = "⚔ 击杀!"
         elif ev["kind"] == "death":
             label = "💀 坠毁!" if ev["mode"] == "aircraft" else "💀 被摧毁!"
+        elif ev["kind"] == "hit":
+            label = "🎯 被命中!"
         else:
             label = "🔧 维修中"
         if ev["kind"] == "repair":
@@ -565,11 +742,16 @@ class App:
     def _finish_active_event(self) -> None:
         """结束当前事件，仅允许击杀结束后恢复仍有效的维修。"""
         finished_kind = self._event_kind
+        stop_output = getattr(self.coyote, "stop_output", None)
+        if callable(stop_output):
+            stop_output()
+        self._strength_sent = None
         self._event_kind = ""
         self._event_mode = ""
         self._event_ch_a = 0
         self._event_ch_b = 0
         self._event_remaining = 0.0
+        self._event_clock = None
         self._overlay_tick = 1
 
         if (finished_kind == "kill"
@@ -589,6 +771,108 @@ class App:
             and state.connected and tank and tank.valid
             and tank.is_repairing and self._cfg.tank_events.repair_enabled
         )
+
+    def _update_part_damage(self, tank_data) -> None:
+        """检测坦克部件/乘员损伤边沿，触发部件损伤短脉冲。
+
+        每帧无条件更新损毁部件基线（基线未知时本帧只建立基线）；出现新损毁部件（被打坏履带、引擎、
+        乘员阵亡等）且通过开关与冷却检查时，构造 hit 事件交由
+        `_apply_event` 应用（其内部守卫保证不抢占更高级事件输出）。
+        """
+        current = tank_data.damaged_parts
+        previous = getattr(self, "_last_damaged_parts", None)
+        self._last_damaged_parts = current
+        if previous is None:
+            # 重新进入陆战地面：已损坏的部件不是本次边沿，只建立基线
+            return
+        new_damage = current - previous
+        if not new_damage:
+            return
+
+        te_cfg = self._cfg.tank_events
+        if not getattr(te_cfg, "hit_enabled", False):
+            return
+        cooldown = float(getattr(te_cfg, "hit_cooldown", 0.0) or 0.0)
+        now = time.monotonic()
+        if now - getattr(self, "_last_hit_time", 0.0) < cooldown:
+            return
+        self._last_hit_time = now
+        logger.info("部件损伤触发: %s", "、".join(sorted(new_damage)))
+        self._apply_event({
+            "kind": "hit",
+            "mode": "tank",
+            "ch_a": te_cfg.hit_ch_a,
+            "ch_b": te_cfg.hit_ch_b,
+            "duration": te_cfg.hit_duration,
+            "wf_a": te_cfg.hit_wf_a,
+            "wf_b": te_cfg.hit_wf_b,
+        })
+
+    def _update_idle_penalty(self, tank_data, tk_cfg) -> None:
+        """更新陆战静止惩罚状态机。
+
+        速度低于阈值持续超过 idle_timeout_s 后进入惩罚输出，直到恢复移动。
+        维修中、乘员全灭（被击毁）、死亡等待重生、维修事件激活或功能关闭
+        时豁免并重置计时；击杀/被命中事件期间计时继续，仅输出让位给事件。
+        被击毁后进入死亡封锁，复活后首次开动才恢复计时。
+        """
+        exempt = (
+            not tk_cfg.idle_enabled
+            or tank_data.is_repairing
+            or tank_data.crew_alive is False
+            or getattr(self, "_repair_blocked_until_idle", False)
+            or (self._event_kind == "repair" and self._event_remaining > 0)
+        )
+        if exempt:
+            self._reset_idle_penalty()
+            return
+        if abs(tank_data.speed_kmh) >= tk_cfg.idle_speed_max:
+            if getattr(self, "_idle_death_blocked", False):
+                # 死亡瞬间的残留速度帧（坦克被击毁时仍在滑行）只有一两帧，
+                # 不能据此解除封锁：持续移动满 IDLE_UNBLOCK_FRAMES 帧才确认。
+                frames = getattr(self, "_idle_move_frames", 0) + 1
+                self._idle_move_frames = frames
+                if frames >= self.IDLE_UNBLOCK_FRAMES:
+                    self._idle_death_blocked = False
+                    self._idle_move_frames = 0
+                    logger.info("坦克持续移动，解除死亡后静止惩罚封锁")
+            else:
+                self._idle_move_frames = 0
+            self._reset_idle_penalty()
+            return
+        if getattr(self, "_idle_death_blocked", False):
+            # 死亡封锁中：选车界面/出生点的静止帧不计时，且清零移动确认。
+            self._idle_move_frames = 0
+            self._reset_idle_penalty()
+            return
+        now = time.monotonic()
+        start = getattr(self, "_idle_start_time", None)
+        if start is None:
+            self._idle_start_time = now
+            return
+        if (not getattr(self, "_idle_active", False)
+                and now - start >= tk_cfg.idle_timeout_s):
+            self._idle_active = True
+            logger.info("静止惩罚触发：速度为 0 已超过 %.1f 秒",
+                        tk_cfg.idle_timeout_s)
+
+    def _reset_idle_penalty(self) -> None:
+        """退出静止惩罚状态、重置计时并清理仪表盘提示。"""
+        self._idle_start_time = None
+        if getattr(self, "_idle_active", False):
+            self._idle_active = False
+            self._overlay_tick = 1
+            logger.info("恢复移动，静止惩罚结束")
+        if getattr(self, "_idle_label_shown", False):
+            self._idle_label_shown = False
+            self.window.dashboard.show_event("")
+
+    def _set_idle_waveforms(self, tk_cfg) -> None:
+        """静止惩罚期间使用专用波形；随机开关与间隔复用常规配置。"""
+        self._set_output_waveform("A", tk_cfg.idle_wf_a, tk_cfg.idle_random_a,
+                                   tk_cfg.random_min_a, tk_cfg.random_max_a)
+        self._set_output_waveform("B", tk_cfg.idle_wf_b, tk_cfg.idle_random_b,
+                                   tk_cfg.random_min_b, tk_cfg.random_max_b)
 
     def _resume_repair_if_active(self) -> bool:
         """当前坦克仍在有效维修且功能启用时，立即应用维修事件。"""
@@ -623,12 +907,53 @@ class App:
             self._apply_game_state(self._last_state)
             self._apply_waveform()
 
+    def _set_output_waveform(self, channel, name, random_enabled=False,
+                             random_min=30, random_max=50):
+        """缓存波形配置，与下一个强度采样原子提交。"""
+        if hasattr(self, "_desired_waveforms"):
+            self._desired_waveforms[channel] = WaveformConfig(
+                name, random_enabled, random_min, random_max)
+        else:
+            # 保留旧调用者和插件的同步兼容路径。
+            setter = self.coyote.set_waveform_a if channel == "A" else self.coyote.set_waveform_b
+            setter(name, random_enabled, random_min, random_max)
+
+    def _select_coyote_device(self, slot_id):
+        """将设备选择交给后台连接适配器。"""
+        self.coyote.select_device(slot_id)
+
+    def _show_connection_snapshot(self):
+        snapshot = self.coyote.snapshot()
+        key = (id(self.coyote), snapshot.session, snapshot.bound)
+        previous = self._last_connection_session
+        if key != previous:
+            self._last_connection_session = key
+            if previous is not None and (key[:2] != previous[:2] or not snapshot.bound):
+                self._cancel_active_event("连接会话改变，丢弃旧事件输出")
+            self._strength_sent = None
+        panel = self.window.qr_widget
+        panel.set_connection_snapshot(snapshot)
+        self.window.status_bar.set_coyote_status(snapshot.bound, snapshot.address)
+        if snapshot.qr_url != getattr(self, "_displayed_qr", ""):
+            self._displayed_qr = snapshot.qr_url
+            if snapshot.qr_url:
+                self._generate_qr_image(snapshot.qr_url)
+            else:
+                panel.clear_qr_image()
+
     def _update_coyote_status(self):
         """同步郊狼状态到 UI"""
+        if hasattr(self, "_connection_service"):
+            self._show_connection_snapshot()
+            return
         status = self.coyote.status
-        if (self._coyote_protocol == "v4" and self._coyote_started
+        if (self._running and self._coyote_started
                 and not self._coyote_starting
                 and not status.server_running):
+            # 服务 / Relay 连接在运行中意外退出：5 秒后自动重启
+            logger.warning(
+                "郊狼连接服务意外停止（%s），5 秒后重启：%s",
+                self._coyote_protocol, status.error or "无错误信息")
             self._coyote_started = False
             self.window.after(5000, self._start_coyote)
         self.window.status_bar.set_coyote_status(
@@ -685,15 +1010,22 @@ class App:
             return
 
         logger.info(f"切换 DG-LAB 连接协议: {self._coyote_protocol} -> {desired}")
-        self.coyote.clear_all()
-        self.coyote.stop()
+        old_controller = self.coyote
+        old_controller.clear_all()
+        # stop() 最长会阻塞约 6 秒，交给下一次启动线程先停旧再启新，
+        # 既不卡 Qt 主线程，也保证旧服务释放端口后新服务才启动
+        if not hasattr(self, "_connection_service"):
+            self._retiring_controllers.append(old_controller)
         self._coyote_protocol = desired
         self._coyote_started = False
         self._coyote_starting = False
         self.coyote = self._create_coyote_controller()
         self._controllers.append(self.coyote)
         self.window.qr_widget.clear_qr_image()
-        self.window.after(200, self._start_coyote)
+        if hasattr(self, "_connection_service"):
+            self._connection_service.replace(self.coyote)
+        else:
+            self.window.after(200, self._start_coyote)
 
     def _sync_overlay(self, mode: str, intensity_a: int, intensity_b: int):
         """同步数据到悬浮窗（按显示开关与数据有效性逐项显示）"""
@@ -716,8 +1048,12 @@ class App:
                 event_text = "🔧 维修中"
             elif self._event_kind == "kill":
                 event_text = f"⚔ 击杀! ({self._event_remaining:.1f}s)"
+            elif self._event_kind == "hit":
+                event_text = f"🎯 被命中! ({self._event_remaining:.1f}s)"
             elif self._event_kind == "death":
                 event_text = f"💀 坠毁! ({self._event_remaining:.1f}s)" if self._event_mode == "aircraft" else f"💀 被摧毁! ({self._event_remaining:.1f}s)"
+        elif getattr(self, "_idle_active", False):
+            event_text = "🛑 静止超时，请移动!"
 
         # 每种模式只显示其触发指标：空战/CAS 显示过载，陆战地面显示速度；
         # 未进对局或数据无效时显示 -- 占位，短暂无效沿用上次值防跳动
@@ -745,7 +1081,7 @@ class App:
                 speed_text = "--"
 
         # 仅在值变化时更新（减少闪烁）
-        ov.update(mode, g_text, speed_text, intensity_a, intensity_b,
+        ov.update_values(mode, g_text, speed_text, intensity_a, intensity_b,
                   wave_a, wave_b, event_text)
 
     def _overlay_content_flags(self) -> dict:
@@ -846,7 +1182,19 @@ class App:
             self._cfg.app.overlay_size_px = px
             changed = True
         if changed:
-            self.config_mgr.save()
+            # 字号滑条拖动时每个刻度都会进来：内存配置已更新，防抖后再写文件
+            self._schedule_config_save()
+
+    def _schedule_config_save(self) -> None:
+        """停止变更 SAVE_DEBOUNCE_MS 毫秒后写入配置文件。"""
+        timer = getattr(self, "_config_save_timer", None)
+        if timer is None:
+            timer = QTimer()
+            timer.setSingleShot(True)
+            timer.setInterval(SAVE_DEBOUNCE_MS)
+            timer.timeout.connect(self.config_mgr.save)
+            self._config_save_timer = timer
+        timer.start()
 
     def _on_overlay_value_font_changed(self, px: int):
         """悬浮窗右键滑块拖动时同步主窗口滑块（同步过程会自动应用并保存）。"""
@@ -865,14 +1213,17 @@ class App:
 
     def _set_normal_waveforms(self, cfg) -> None:
         """将常规波形及 A/B 独立随机配置发送给控制器。"""
-        self.coyote.set_waveform_a(cfg.waveform_a, cfg.random_enabled_a,
+        self._set_output_waveform("A", cfg.waveform_a, cfg.random_enabled_a,
                                    cfg.random_min_a, cfg.random_max_a)
-        self.coyote.set_waveform_b(cfg.waveform_b, cfg.random_enabled_b,
+        self._set_output_waveform("B", cfg.waveform_b, cfg.random_enabled_b,
                                    cfg.random_min_b, cfg.random_max_b)
 
     def _start_coyote(self):
         """启动当前协议控制器并生成对应 App 配对二维码。"""
         if not self._running:
+            return
+        if hasattr(self, "_connection_service"):
+            self._connection_service.start()
             return
         if self._coyote_started or self._coyote_starting:
             return
@@ -881,9 +1232,11 @@ class App:
         logger.info(f"正在启动郊狼 {label}...")
         self._coyote_starting = True
         controller = self.coyote
+        retiring = getattr(self, "_retiring_controllers", [])
+        self._retiring_controllers = []
         thread = threading.Thread(
             target=self._start_coyote_worker,
-            args=(controller, label),
+            args=(controller, label, retiring),
             daemon=True,
             name="郊狼连接启动",
         )
@@ -892,8 +1245,15 @@ class App:
         self._start_workers.append(thread)
         thread.start()
 
-    def _start_coyote_worker(self, controller, label: str) -> None:
-        """在后台等待连接控制器启动，避免阻塞 Qt 主线程。"""
+    def _start_coyote_worker(self, controller, label: str,
+                             retiring=()) -> None:
+        """在后台先停止旧控制器，再等待新控制器启动，避免阻塞 Qt 主线程。"""
+        for old_controller in retiring:
+            try:
+                old_controller.stop()
+            except Exception:
+                logger.exception("停止旧郊狼控制器失败")
+                mark_runtime_abnormal("停止旧郊狼控制器失败")
         success = controller.start()
         url = controller.get_qrcode_url() if success else ""
         result = (controller, label, success, url, controller.status.error)
@@ -912,12 +1272,29 @@ class App:
                     self._coyote_start_queue.get_nowait()
                 )
                 if controller is not self.coyote:
-                    controller.stop()
+                    # 启动期间已切换协议：过期控制器在后台停止，不阻塞主线程
+                    self._stop_controller_in_background(controller)
                     continue
                 self._coyote_starting = False
                 self._finish_coyote_start(label, success, url, error)
         except queue.Empty:
             pass
+
+    def _stop_controller_in_background(self, controller) -> None:
+        """在守护线程中停止控制器，并登记到退出时等待的线程列表。"""
+        def stop_worker():
+            try:
+                controller.stop()
+            except Exception:
+                logger.exception("停止过期郊狼控制器失败")
+                mark_runtime_abnormal("停止过期郊狼控制器失败")
+
+        thread = threading.Thread(
+            target=stop_worker, daemon=True, name="郊狼控制器停止")
+        self._start_workers = [worker for worker in self._start_workers
+                               if worker.is_alive()]
+        self._start_workers.append(thread)
+        thread.start()
 
     def _finish_coyote_start(self, label: str, success: bool,
                              url: str, error: str) -> None:
@@ -969,6 +1346,31 @@ class App:
         if reason and reason != getattr(self, "_last_strength_warning", ""):
             logger.warning(reason)
         self._last_strength_warning = reason
+
+        if hasattr(self, "_desired_waveforms"):
+            active_event = self._event_remaining > 0
+            source = (f"event:{self._output_revision}:{self._event_kind}"
+                      if active_event else "normal")
+            # 维修是由当前遥测续期的持续状态，其余事件使用绝对到期时间。
+            deadline = (getattr(self, "_event_deadline", None)
+                        if active_event and self._event_kind != "repair" else None)
+            telemetry_deadline = getattr(self, "_last_telemetry_at", 0.0) + 1.0
+            deadline = min(deadline, telemetry_deadline) if deadline is not None else telemetry_deadline
+            self.coyote.submit_output(OutputIntent(
+                ChannelTarget(value_a, self._desired_waveforms["A"]),
+                ChannelTarget(value_b, self._desired_waveforms["B"]),
+                source, deadline))
+            return
+
+        # 去重：值不变时每 STRENGTH_KEEPALIVE_S 秒才重发一次。
+        # 控制器对象或绑定状态变化（重连 / 切换协议）后第一帧必定下发。
+        now = time.monotonic()
+        key = (id(self.coyote), status.bound, value_a, value_b)
+        last = getattr(self, "_strength_sent", None)
+        if (last is not None and last[0] == key
+                and now - last[1] < self.STRENGTH_KEEPALIVE_S):
+            return
+        self._strength_sent = (key, now)
         self.coyote.set_strength_a(value_a)
         self.coyote.set_strength_b(value_b)
 

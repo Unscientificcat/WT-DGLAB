@@ -85,6 +85,9 @@ def validate_package(package_dir: Path) -> None:
         elif (path.is_file() and path.suffix.lower() in {".py", ".pyw"}
               and relative.parts[0] != "_internal"):
             violations.append(str(relative))
+        elif path.is_file() and path.suffix.lower() == ".pulse":
+            # 自定义波形属于用户个人文件，发布包只保留空的 waveforms/ 目录
+            violations.append(str(relative))
     if violations:
         sample = ", ".join(violations[:10])
         raise RuntimeError(f"运行包包含禁止内容: {sample}")
@@ -97,6 +100,8 @@ def _create_zip(package_dir: Path, zip_path: Path) -> None:
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
         if (package_dir / "waveforms").is_dir():
             archive.writestr(f"{package_dir.name}/waveforms/", "")
+        if (package_dir / "backgrounds").is_dir():
+            archive.writestr(f"{package_dir.name}/backgrounds/", "")
         for path in package_dir.rglob("*"):
             if path.is_file():
                 if path.name == "config.json":

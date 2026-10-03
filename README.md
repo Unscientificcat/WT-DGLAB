@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-<img src="https://img.shields.io/badge/version-v1.1.1-4f8fe8" alt="版本 v1.1.1">
+<img src="https://img.shields.io/badge/version-v1.1.2-4f8fe8" alt="版本 v1.1.2">
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-2d7dd2" alt="Windows 10 / 11">
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776ab" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/DG--LAB%20App-V3%20%2F%20V4-ef6f91" alt="DG-LAB App V3 / V4">
@@ -26,7 +26,7 @@
 
 本项目是一个 Vibe Coding 实践作品，代码、协议判断和安全行为仍应以实际测试结果为准。
 
-当前版本为 `v1.1.1`。协议、界面和自动化回归已经验证；DG-LAB 4.x App 与实际郊狼设备的完整实机联调仍在进行中，请谨慎测试。
+当前版本为 `v1.1.2`。协议、界面和自动化回归已经验证；DG-LAB 4.x App 与实际郊狼设备的完整实机联调仍在进行中，请谨慎测试。
 
 ## 功能
 
@@ -86,7 +86,7 @@
 
 ### 使用发布版 EXE
 
-1. 从 GitHub Releases 下载 `WT-DGLAB v1.1.1.zip` 并完整解压。
+1. 从 GitHub Releases 下载 `WT-DGLAB v1.1.2.zip` 并完整解压。
 2. 启动《战争雷霆》，进入机库或对局。
 3. 运行目录中的 `WT-DGLAB.exe`，阅读并确认注意事项。
 4. 在右侧“连接郊狼”区域选择 `V3 App` 或 `V4 App`。
@@ -111,7 +111,7 @@ V3 只需要局域网入站连接，不需要在路由器上配置公网端口�
 1. 在程序右侧选择 `V4 App`，程序会立即保存选择并连接 Relay。
 2. 默认 Relay 为 `wss://trex.dungeon-lab.cn/v4`，也可以填写自行部署的 `ws://` 或 `wss://` 地址。
 3. 等待二维码刷新后，在 DG-LAB 4.x App 中选择 Socket 控制并扫码。
-4. App 接入后，程序会选择首个可用的郊狼设备槽位并先将 A/B 通道归零。
+4. App 接入后，唯一可用设备自动选择，多个候选需要手选；选定后先将 A/B 通道归零。
 
 V4 由程序主动连接 Relay，通常不需要开放电脑的 `8765` 入站端口。官方 Relay 不可达时，可以部署官方 `dglab-websocket-server` 并在界面中填写自建地址。
 
@@ -195,6 +195,14 @@ value >= max  -> channel_max
 - 官方 Relay 不可用时尝试自建 Relay。
 - 切回 V3 再切换到 V4 会自动重建连接并刷新二维码，无需点击“保存设置”。
 
+### 连接重构后的状态与事件停止（当前源码）
+
+右侧显示目标强度、App 实际上报及更新时间；“未知”表示尚未收到报告。多个 V4 设备需要手动选择，设备离线不会自动转到另一台。静音和上限由 App 决定，程序不会提高 App 的上限。
+
+事件结束时先清理事件输出；当前速度/过载仍对应非零目标时，会恢复常态强度与波形。连续停止/恢复失败会显示通道错误，请检查 App 并重新连接。详细复测步骤见 [连接重构与实机验收](docs/connection-refactor.md)。
+
+此次修改随 v1.1.2 打包，历史 EXE 不包含本次重构，Android App 4.2.6.1 + 郊狼 3.0 的实机验证仍待完成。
+
 ### 刚退出对局后数值被清空
 
 这是预期的安全行为。战争雷霆在退出对局后可能保留 `/indicators` 的旧速度，程序以 `/map_info.json` 的有效状态作为输出门槛，避免继续使用残留数据。
@@ -235,7 +243,7 @@ python -m pytest -q
 python build.py
 ```
 
-打包脚本使用 PyInstaller `--onedir --windowed`，在 `dist/` 生成 `WT-DGLAB v1.1.1/` 目录及同名 ZIP。目录包含 `WT-DGLAB.exe`、`_internal/`、`resources/`、安全默认模板、README 和 LICENSE。用户配置只保存在 EXE 同目录的 `config.json`；新版本不会自动迁移旧目录配置。
+打包脚本使用 PyInstaller `--onedir --windowed`，在 `dist/` 生成 `WT-DGLAB v1.1.2/` 目录及同名 ZIP。目录包含 `WT-DGLAB.exe`、`_internal/`、`resources/`、安全默认模板、README 和 LICENSE。用户配置只保存在 EXE 同目录的 `config.json`；新版本不会自动迁移旧目录配置。
 
 ## 架构
 
@@ -279,6 +287,13 @@ python build.py
 更详细的技术资料见 [docs/tech-spec.md](docs/tech-spec.md)、[docs/ui-redesign.md](docs/ui-redesign.md) 和 [docs/v4-app-adaptation.md](docs/v4-app-adaptation.md)。
 
 ## 更新日志
+
+### v1.1.2
+
+- 重构 V3/V4 连接会话、设备选择和后台输出调度，界面区分初始化、离线、静音与 App 上报状态。
+- 事件停止先清理任务再归零，重连重新建立强度基准；过期遥测和事件由后台停止输出。
+- 波形按连续 100ms 帧播放，修正补给时序与播放进度；保留现有映射与幅度缩放。
+- 包含静止惩罚、部件损伤及配置保存等近期修复。Android App 4.2.6.1 / 郊狼 3.0 实机验收仍待完成。
 
 ### v1.1.1
 
@@ -407,7 +422,7 @@ python build.py
 
 - `config.json` 可能包含玩家昵称和个人强度设置，公开仓库前应确认其中没有隐私信息。
 - `wt-dglab-trace.log` 属于诊断日志，不应作为正式发布内容。
-- 建议通过 GitHub Releases 分发 `WT-DGLAB v1.1.1.zip`，不要要求普通用户从源码构建。
+- 建议通过 GitHub Releases 分发 `WT-DGLAB v1.1.2.zip`，不要要求普通用户从源码构建。
 
 ## 相关资料
 
