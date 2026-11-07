@@ -144,7 +144,7 @@ def test_pulse_is_encoded_as_official_eight_byte_hex_frame():
         100,
     )
 
-    assert frame == "0A141E2832281E14"
+    assert frame == "0A141E2864503C28"
 
 
 def test_app_switches_controller_after_protocol_setting_is_saved():
@@ -240,7 +240,7 @@ async def test_strength_commands_use_delta_pulse_reset_and_clear():
     pulse = operation_from(websocket.messages[1])
     assert pulse["t"] == 0
     assert pulse["d"] == 1000
-    assert pulse["v"] == ["0A0A0A0A14141414"] * 10
+    assert pulse["v"] == ["0A0A0A0A64646464"] * 10
 
     websocket.messages.clear()
     await controller._execute_command(("strength", "A", 20))

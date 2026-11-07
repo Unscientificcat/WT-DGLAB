@@ -1,4 +1,4 @@
-"""波形名显示、通道卡点击与输出电压曲线窗口回归测试。"""
+"""波形名显示、通道卡点击与输出强度曲线窗口回归测试。"""
 
 import asyncio
 import os
@@ -72,8 +72,8 @@ async def test_v4_constant_strength_records_output_batch():
     assert snapshot.name == "恒定"
     assert snapshot.strength == 100
     assert snapshot.active
-    # 恒定波形幅度按强度/200 缩放：100/200 × 100 = 50，电压显示 100
-    assert snapshot.batches[-1].amplitudes == (50, 50, 50, 50)
+    # 恒定波形始终满幅；曲线用通道强度乘幅度百分比估算
+    assert snapshot.batches[-1].amplitudes == (100, 100, 100, 100)
 
 
 @pytest.mark.asyncio
@@ -95,8 +95,8 @@ async def test_v4_zero_strength_records_silence():
 
 
 @pytest.mark.asyncio
-async def test_v4_preset_waveform_records_name_and_scaled_amplitudes(tmp_path):
-    """V4 切换预设波形后遥测跟随更新，幅度按强度缩放。"""
+async def test_v4_preset_waveform_records_name_and_original_amplitudes(tmp_path):
+    """V4 切换预设波形后遥测跟随更新，保留波形原始幅度。"""
     catalog = _write_waveform_file(tmp_path)
     controller = CoyoteV4Controller(catalog=catalog)
 
@@ -110,8 +110,8 @@ async def test_v4_preset_waveform_records_name_and_scaled_amplitudes(tmp_path):
     await controller._execute_command(("strength", "A", 100))
 
     snapshot = controller.telemetry.snapshot("A")
-    # 预设首帧为曲线点 50 的 4 个采样，按强度 100/200=0.5 缩放为 25
-    assert snapshot.batches[-1].amplitudes == (25, 25, 25, 25)
+    # 首帧四个采样保留曲线原始百分比，不叠加通道强度缩放。
+    assert snapshot.batches[-1].amplitudes == (50, 50, 50, 50)
 
 
 @pytest.mark.asyncio
@@ -151,8 +151,8 @@ async def test_v3_strength_records_constant_batch_and_silence():
     snapshot = controller.telemetry.snapshot("A")
     assert snapshot.name == "恒定"
     assert snapshot.strength == 100
-    # V3 恒定幅度 = 强度 // 2 = 50，电压显示 100
-    assert snapshot.batches[-1].amplitudes == (50, 50, 50, 50)
+    # V3 恒定幅度始终为 100%。
+    assert snapshot.batches[-1].amplitudes == (100, 100, 100, 100)
 
     await controller._exec_command(("strength", "A", 0))
     assert not controller.telemetry.snapshot("A").active

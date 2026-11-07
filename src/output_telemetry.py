@@ -1,4 +1,4 @@
-"""郊狼输出遥测 — 记录控制器实际下发的波形，供界面显示波形名与电压曲线。
+"""郊狼输出遥测 — 记录控制器实际下发的波形，供界面显示波形名与强度曲线。
 
 架构：
     控制器 asyncio 线程调用 record_* 记录
@@ -29,7 +29,7 @@ def display_waveform_name(name: str) -> str:
 class PulseBatch:
     """一次下发的波形批次：4 个 25ms 采样点的最终幅度（0-100）。"""
     t: float                              # 下发时刻（time.monotonic）
-    amplitudes: tuple[int, int, int, int]  # 最终幅度字节，电压 = 幅度 × 2
+    amplitudes: tuple[int, int, int, int]  # 原始幅度百分比，估算输出 = strength × 幅度 / 100
     strength: int                          # 下发时的通道强度 0-200
 
 
@@ -47,7 +47,7 @@ class OutputTelemetry:
 
     每个郊狼控制器（V3/V4）持有一个实例；控制器线程在波形切换和
     每次下发波形批次时记录，GUI 主线程只读快照用于波形名显示和
-    输出电压曲线窗口。
+    输出强度曲线窗口。
     """
 
     def __init__(self, max_batches: int = 240):

@@ -1,0 +1,142 @@
+{
+  "description": "2026-10-16 现场采集的最小匿名样本；保留 ID 18 及新增／被覆盖的 ID 19–21，文本中的零宽字符保持原样。",
+  "frames": [
+    {
+      "observed_at": "2026-10-16T21:12:02.552+08:00",
+      "damage": [
+        {
+          "id": 18,
+          "msg": "玩家 (◍​M1A1 HC) 击​毁​了 T-62",
+          "sender": "",
+          "enemy": false,
+          "mode": "",
+          "time": 8
+        }
+      ]
+    },
+    {
+      "observed_at": "2026-10-16T21:12:26.621+08:00",
+      "damage": [
+        {
+          "id": 18,
+          "msg": "玩家 (◍​M1A1 HC) 击​毁​了 T-62",
+          "sender": "",
+          "enemy": false,
+          "mode": "",
+          "time": 8
+        },
+        {
+          "id": 19,
+          "msg": "玩家 (◍​M1A1 HC) 击​毁​了 IT-1",
+          "sender": "",
+          "enemy": false,
+          "mode": "",
+          "time": 4
+        }
+      ]
+    },
+    {
+      "observed_at": "2026-10-16T21:12:32.228+08:00",
+      "damage": [
+        {
+          "id": 18,
+          "msg": "玩家 (◍​M1A1 HC) 击​毁​了 T-62",
+          "sender": "",
+          "enemy": false,
+          "mode": "",
+          "time": 8
+        },
+        {
+          "id": 19,
+          "msg": "玩家 (◍​M1A1 HC) 击​毁​了 IT-1",
+          "sender": "",
+          "enemy": false,
+          "mode": "",
+          "time": 4
+        },
+        {
+          "id": 20,
+          "msg": "玩家 (◍​M1A1 HC) 击​毁​了 T-55A",
+          "sender": "",
+          "enemy": false,
+          "mode": "",
+          "time": 10
+        }
+      ]
+    },
+    {
+      "observed_at": "2026-10-16T21:12:37.854+08:00",
+      "damage": [
+        {
+          "id": 18,
+          "msg": "玩家 (◍​M1A1 HC) 击​毁​了 T-62",
+          "sender": "",
+          "enemy": false,
+          "mode": "",
+          "time": 8
+        },
+        {
+          "id": 19,
+          "msg": "玩家 (◍​M1A1 HC) 击​毁​了 IT-1",
+          "sender": "",
+          "enemy": false,
+          "mode": "",
+          "time": 4
+        },
+        {
+          "id": 20,
+          "msg": "玩家 (◍​M1A1 HC) 击​毁​了 T-55A",
+          "sender": "",
+          "enemy": false,
+          "mode": "",
+          "time": 10
+        },
+        {
+          "id": 21,
+          "msg": "玩家 (◍​M1A1 HC) 击​毁​了 T-62",
+          "sender": "",
+          "enemy": false,
+          "mode": "",
+          "time": 15
+        }
+      ]
+    },
+    {
+      "observed_at": "2026-10-16T21:12:56.338+08:00",
+      "damage": [
+        {
+          "id": 18,
+          "msg": "玩家 (◍​M1A1 HC) 击​毁​了 T-62",
+          "sender": "",
+          "enemy": false,
+          "mode": "",
+          "time": 8
+        },
+        {
+          "id": 19,
+          "msg": "玩家 (◍​M1A1 HC) 击​毁​了 IT-1",
+          "sender": "",
+          "enemy": false,
+          "mode": "",
+          "time": 2
+        },
+        {
+          "id": 20,
+          "msg": "玩家 (◍​M1A1 HC) 击​毁​了 T-55A",
+          "sender": "",
+          "enemy": false,
+          "mode": "",
+          "time": 10
+        },
+        {
+          "id": 21,
+          "msg": "玩家 (◍​M1A1 HC) 击​毁​了 T-62",
+          "sender": "",
+          "enemy": false,
+          "mode": "",
+          "time": 15
+        }
+      ]
+    }
+  ]
+}

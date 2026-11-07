@@ -73,7 +73,7 @@ def active_state(vehicle_type="tank", repairing=False):
 
 
 def test_first_successful_read_only_establishes_history_baseline():
-    """首次成功读取只定位历史游标，不触发旧记录。"""
+    """首次成功读取只建立历史指纹，不触发旧记录。"""
     reader = QueuedReader([(True, [
         {"id": 3, "msg": "玩家击毁了敌人"},
         {"id": 5, "msg": "玩家击毁了另一个敌人"},
@@ -102,7 +102,7 @@ def test_failed_read_does_not_establish_history_baseline():
 
 
 def test_menu_consumes_new_ids_without_triggering_events():
-    """菜单阶段持续推进游标，但不输出历史事件。"""
+    """菜单阶段持续更新历史指纹，但不输出历史事件。"""
     reader = QueuedReader([
         (True, [{"id": 7, "msg": "旧记录"}]),
         (True, [{"id": 8, "msg": "玩家击毁了敌人"}]),
@@ -115,7 +115,7 @@ def test_menu_consumes_new_ids_without_triggering_events():
 
     assert event == {}
     assert detector.last_dmg_id == 8
-    assert reader.last_dmg_ids == [0, 7]
+    assert reader.last_dmg_ids == [0, 0]
 
 
 def test_first_event_after_entering_a_new_match_triggers_immediately():
@@ -358,7 +358,7 @@ def test_duplicate_id_does_not_trigger_twice():
 
     assert first["kind"] == "kill"
     assert duplicate == {}
-    assert reader.last_dmg_ids == [0, 1, 2]
+    assert reader.last_dmg_ids == [0, 0, 0]
 
 
 def test_repair_only_triggers_on_rising_edge():
@@ -435,7 +435,7 @@ def test_land_cas_uses_tank_event_configuration():
 
 
 def test_land_cas_disabled_consumes_records_without_event():
-    """关闭 CAS 触发后仍推进 HUD 游标，但不输出飞机事件。"""
+    """关闭 CAS 触发后仍更新历史指纹，但不输出飞机事件。"""
     reader = QueuedReader([
         (True, []),
         (True, [{"id": 1, "msg": "玩家击落了敌机"}]),

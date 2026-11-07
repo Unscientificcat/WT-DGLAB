@@ -1,8 +1,8 @@
-"""输出电压波形曲线组件与单通道曲线窗口。
+"""输出强度波形曲线组件与单通道曲线窗口。
 
 数据来自控制器的 OutputTelemetry 快照：每个批次记录了实际下发的
 4 个 25ms 采样点（最终幅度 0-100），绘制时按批次真实间隔平铺采样点，
-电压刻度与强度条一致（幅度 × 2 → 0-200）。
+指令估算刻度为通道强度 × 波形幅度 / 100。
 """
 
 import time
@@ -23,7 +23,7 @@ POINT_SECONDS = 0.025
 # 最新批次超过该时长仍无新数据，视为输出已停止（正常输出约 0.2s 一批）
 STALE_SECONDS = 0.6
 # 纵轴刻度与强度条一致
-MAX_VOLTAGE = 200
+MAX_STRENGTH = 200
 
 
 def _empty_snapshot() -> ChannelOutputSnapshot:
@@ -32,7 +32,7 @@ def _empty_snapshot() -> ChannelOutputSnapshot:
 
 
 class WaveformScope(QWidget):
-    """滚动显示单通道输出电压（0-200）的示波器画布。"""
+    """滚动显示单通道输出强度估算（0-200）的示波器画布。"""
 
     def __init__(self, color: str, parent: QWidget | None = None):
         super().__init__(parent)
@@ -50,7 +50,7 @@ class WaveformScope(QWidget):
         self.update()
 
     def _build_points(self, now: float) -> list[tuple[float, float]]:
-        """把批次采样点平铺为 (时刻, 电压) 折线点，旧→新。"""
+        """把批次采样点平铺为 (时刻, 强度) 折线点，旧→新。"""
         window_start = now - WINDOW_SECONDS
         recent = [item for item in self._batches if window_start <= item.t <= now]
         if not recent or (now - recent[-1].t) > STALE_SECONDS:
@@ -64,12 +64,12 @@ class WaveformScope(QWidget):
                 for amplitude in batch.amplitudes:
                     if moment >= end:
                         break
-                    points.append((moment, amplitude * 2))
+                    points.append((moment, batch.strength * amplitude / 100.0))
                     moment += POINT_SECONDS
         return points
 
     def paintEvent(self, event) -> None:
-        """绘制网格、电压曲线与当前强度参考线。"""
+        """绘制网格、强度曲线与当前强度参考线。"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
 
@@ -85,7 +85,7 @@ class WaveformScope(QWidget):
             return right - (now - moment) / WINDOW_SECONDS * span
 
         def to_y(voltage: float) -> float:
-            return bottom - max(0.0, min(MAX_VOLTAGE, voltage)) / MAX_VOLTAGE * height
+            return bottom - max(0.0, min(MAX_STRENGTH, voltage)) / MAX_STRENGTH * height
 
         now = time.monotonic()
         background = QColor(COLORS["bg_soft"])
@@ -101,7 +101,7 @@ class WaveformScope(QWidget):
             y = to_y(voltage)
             painter.drawLine(int(left), int(y), int(right), int(y))
         painter.setPen(QColor(COLORS["text_secondary"]))
-        painter.drawText(2, int(to_y(MAX_VOLTAGE)) + 10, "200")
+        painter.drawText(2, int(to_y(MAX_STRENGTH)) + 10, "200")
         painter.drawText(2, int(bottom) - 2, "0")
 
         # 底部零线
@@ -138,7 +138,7 @@ class WaveformScope(QWidget):
 
 
 class ChannelScopeDialog(QDialog):
-    """单通道输出电压曲线窗口（非模态，由 App 按通道单例管理）。"""
+    """单通道输出强度曲线窗口（非模态，由 App 按通道单例管理）。"""
 
     def __init__(self, channel: str, telemetry_provider, bound_provider,
                  parent: QWidget | None = None):
@@ -149,7 +149,7 @@ class ChannelScopeDialog(QDialog):
 
         self.setObjectName("channelScopeDialog")
         self.setModal(False)
-        self.setWindowTitle(f"{self._channel} 通道输出电压曲线")
+        self.setWindowTitle(f"{self._channel} 通道输出强度曲线")
         self.setMinimumSize(420, 240)
 
         color = COLORS["primary"] if self._channel == "A" else COLORS["aqua"]
@@ -160,7 +160,7 @@ class ChannelScopeDialog(QDialog):
         self.info_label = QLabel("未连接郊狼设备")
         self.info_label.setObjectName("scopeInfoLabel")
         layout.addWidget(self.info_label)
-        self.estimate_label = QLabel("按下发波形估算的播放曲线，非设备电压实测")
+        self.estimate_label = QLabel("按通道强度和波形幅度估算，非设备电压实测")
         self.estimate_label.setObjectName("scopeEstimateHint")
         self.estimate_label.setWordWrap(True)
         layout.addWidget(self.estimate_label)

@@ -29,6 +29,8 @@ class OutputIntent:
     b: ChannelTarget = ChannelTarget()
     source: str = "normal"
     expires_at: float | None = None
+    expected_session: int | None = None  # 提交时核对会话，拒绝检查后重连的旧采样
+    identified_at: float | None = None  # 仅用于事件计时，不改变输出资格或期限
 
 
 @dataclass(frozen=True)

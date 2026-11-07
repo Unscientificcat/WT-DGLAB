@@ -1,0 +1,38 @@
+# Python 缓存与虚拟环境
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# 用户配置、日志与个人文件
+config.json
+config.json.tmp
+logs/
+*.log
+/waveforms/*
+!/waveforms/.gitkeep
+*.pulse
+/backgrounds/*
+!/backgrounds/.gitkeep
+.env
+.env.*
+!.env.example
+
+# 构建产物与本地发布快照
+/build/
+/dist/
+/backup/
+/release/
+/realise/
+*.apk
+WT-DGLAB v*.zip
+WT-DGLAB v*.zip.sha256
+
+# 本地工具与研究资料
+/.zcode/
+/_research/
+/_research_*.json
+Thumbs.db
+desktop.ini

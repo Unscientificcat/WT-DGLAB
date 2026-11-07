@@ -232,7 +232,7 @@ class StatusBar(GlassCard):
 
 
 class ChannelCard(GlassCard):
-    """单通道实时强度卡片，点击打开该通道输出电压曲线窗口。"""
+    """单通道实时强度卡片，点击打开该通道输出强度曲线窗口。"""
 
     clicked = Signal(str)
 
@@ -269,7 +269,7 @@ class ChannelCard(GlassCard):
         self.wave_label.setObjectName("channelWaveName")
         self.wave_hint = QLabel("📈")
         self.wave_hint.setObjectName("channelWaveHint")
-        self.wave_hint.setToolTip("点击卡片查看输出电压曲线")
+        self.wave_hint.setToolTip("点击卡片查看输出强度曲线")
         wave_row.addWidget(self.wave_label)
         wave_row.addStretch()
         wave_row.addWidget(self.wave_hint)
@@ -279,7 +279,7 @@ class ChannelCard(GlassCard):
         layout.addLayout(wave_row)
 
         self.setCursor(Qt.PointingHandCursor)
-        self.setToolTip(f"点击查看 {channel} 通道输出电压曲线")
+        self.setToolTip(f"点击查看 {channel} 通道输出强度曲线")
 
     def set_value(self, value: int) -> None:
         """显示强度数值与进度。"""
@@ -504,7 +504,7 @@ class Dashboard(QFrame):
         self._overlay_content_callback = callback
 
     def set_scope_callback(self, callback: Callable | None) -> None:
-        """设置通道卡点击后打开输出电压曲线窗口的处理回调。"""
+        """设置通道卡点击后打开输出强度曲线窗口的处理回调。"""
         self._scope_callback = callback
 
     def get_mode(self) -> str:
@@ -1619,6 +1619,7 @@ class QRWidget(QFrame):
         self.setObjectName("connectionPanel")
         self._qr_image_ref: QPixmap | None = None
         self._protocol = "v3"
+        self._connected = False
         self._on_protocol_changed = on_protocol_changed
         self.on_device_selected = None
         self._device_items = None
@@ -1671,6 +1672,7 @@ class QRWidget(QFrame):
         # 连接地址是含长不可断行片段的 URL，其最小宽度提示会锁死分栏无法调窄，
         # 改为忽略水平宽度提示，由换行自行适应分栏宽度
         self.url_text.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.url_text.hide()
         status_card = GlassCard(self)
         status_card.setProperty("glassDisabled", True)
         status_card.setObjectName("connectionStatusCard")
@@ -1687,6 +1689,7 @@ class QRWidget(QFrame):
         self.output_status = QLabel("")
         self.output_status.setObjectName("dglabOutputStatus")
         self.output_status.setWordWrap(True)
+        self.output_status.hide()
         status_layout.addWidget(self.output_status)
         # V3 WebSocket 服务监听所有网卡且无鉴权，提示仅在可信网络使用
         self.lan_notice = QLabel("V3 服务对局域网开放，请仅在可信网络使用")
@@ -1763,8 +1766,7 @@ class QRWidget(QFrame):
             self.on_device_selected(slot)
 
     def set_connection_snapshot(self, snapshot):
-        """显示后台状态；上报未知不冒充蓝牙或归零确认。"""
-        import time
+        """连接成功仅显示简短状态，诊断详情由后台日志保留。"""
         labels = {
             "idle": "连接未启动", "starting": "正在启动连接…",
             "waiting_app": "等待手机扫码连接…", "waiting_device": "App 已接入，等待设备…",
@@ -1772,8 +1774,8 @@ class QRWidget(QFrame):
             "ready": "已就绪", "recovering": "停止待确认／正在恢复…",
             "stopping": "正在停止…", "error": "连接或输出异常",
         }
-        self.set_status(labels.get(snapshot.state, snapshot.state), snapshot.error or snapshot.address)
-        self.qr_frame.setVisible(not snapshot.bound)
+        self.set_status("已连接" if snapshot.bound else
+                        labels.get(snapshot.state, "正在连接…"))
         items = tuple((d.slot_id, d.name, d.available) for d in snapshot.devices)
         key = (items, snapshot.selected_device)
         if key != self._device_items:
@@ -1789,31 +1791,8 @@ class QRWidget(QFrame):
             self.device_selector.setCurrentIndex(max(0, selected))
             self.device_selector.blockSignals(False)
         self.device_selector.setVisible(
-            self._protocol == "v4"
+            not snapshot.bound and self._protocol == "v4"
             and (len(items) > 1 or snapshot.state == "waiting_selection"))
-        lines = []
-        for name, ch in (("A", snapshot.a), ("B", snapshot.b)):
-            report = "未知" if ch.reported is None else str(ch.reported)
-            age = (f"，{max(0, time.monotonic() - ch.reported_at):.1f}秒前"
-                   if ch.reported_at is not None else "")
-            flags = []
-            if ch.muted:
-                flags.append("App 静音")
-            if ch.limit is not None:
-                flags.append(f"App 上限 {ch.limit}")
-            if ch.pending_stop:
-                flags.append("停止待确认" if self._protocol == "v4" else "停止待发送")
-            if ch.error:
-                flags.append(ch.error)
-            lines.append(f"{name} 目标 {ch.target} · App {report}{age}" +
-                         ("\n" + "；".join(flags) if flags else ""))
-        if self._protocol == "v3":
-            lines.append("V3 不提供蓝牙连接确认")
-        self.output_status.setText("\n".join(lines))
-        self.output_status.setMinimumHeight(max(
-            self.output_status.fontMetrics().height() * sum(line.count("\n") + 1 for line in lines),
-            self.output_status.heightForWidth(max(1, self.output_status.width())),
-        ))
 
     def set_protocol(self, protocol: str) -> None:
         """切换 V3/V4 设置项的显示状态。"""
@@ -1825,7 +1804,9 @@ class QRWidget(QFrame):
         self.ws_port.setVisible(not is_v4)
         self.relay_label.setVisible(is_v4)
         self.v4_relay_url.setVisible(is_v4)
-        self.lan_notice.setVisible(not is_v4)
+        self.lan_notice.setVisible(not is_v4 and not self._connected)
+        if not is_v4:
+            self.device_selector.hide()
 
     def get_protocol(self) -> str:
         """返回当前选择的 DG-LAB App 协议。"""
@@ -1860,10 +1841,18 @@ class QRWidget(QFrame):
         self.qr_canvas.setText("二维码\n等待启动")
 
     def set_status(self, text: str, url: str = "") -> None:
-        """更新连接状态，连接成功后收起二维码。"""
+        """更新简短连接状态；地址参数仅保留旧调用兼容。"""
+        self._connected = text == "已连接"
         self.status_text.setText(text)
-        self.url_text.setText(url)
-        self.qr_frame.setVisible("已连接" not in text)
+        self.url_text.clear()
+        self.url_text.hide()
+        self.output_status.clear()
+        self.output_status.setMinimumHeight(0)
+        self.output_status.hide()
+        self.qr_frame.setVisible(not self._connected)
+        self.lan_notice.setVisible(self._protocol == "v3" and not self._connected)
+        if self._connected:
+            self.device_selector.hide()
 
 
 class MainWindow(QMainWindow):

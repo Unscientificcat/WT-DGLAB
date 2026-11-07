@@ -16,9 +16,10 @@ _TYPE_ORDER = {"stop": -1, "waveform": 0, "strength": 1}
 class CommandMailbox:
     """线程安全的最新命令邮箱，接口与 queue.Queue 的非阻塞部分兼容。"""
 
-    def __init__(self):
+    def __init__(self, batch_stops: bool = False):
         self._lock = threading.Lock()
         self._pending: dict[tuple, tuple] = {}
+        self._batch_stops = batch_stops
 
     @staticmethod
     def _key(command: tuple) -> tuple:
@@ -35,12 +36,17 @@ class CommandMailbox:
 
     def put_stop(self, channel: str, discard_waveform: bool = True) -> None:
         """提交不可被普通命令覆盖的通道停止屏障。"""
+        self.put_stops((channel,), discard_waveform)
+
+    def put_stops(self, channels, discard_waveform: bool = True) -> None:
+        """原子提交一批停止，避免消费者在 A/B 提交之间取出命令。"""
         with self._lock:
-            for key in list(self._pending):
-                if key[1] == channel and (key[0] == "strength"
-                        or (discard_waveform and key[0] == "waveform")):
-                    del self._pending[key]
-            self._pending[("stop", channel)] = ("stop", channel)
+            for channel in channels:
+                for key in list(self._pending):
+                    if key[1] == channel and (key[0] == "strength"
+                            or (discard_waveform and key[0] == "waveform")):
+                        del self._pending[key]
+                self._pending[("stop", channel)] = ("stop", channel)
 
     def has_stop(self, channel: str) -> bool:
         """检查在途操作之后是否必须先执行停止屏障。"""
@@ -52,6 +58,13 @@ class CommandMailbox:
         with self._lock:
             if not self._pending:
                 raise queue.Empty
+            if self._batch_stops:
+                channels = tuple(ch for ch in ("A", "B")
+                                 if ("stop", ch) in self._pending)
+                if len(channels) > 1:
+                    for channel in channels:
+                        del self._pending[("stop", channel)]
+                    return ("stop_batch", None, channels)
             key = min(
                 self._pending,
                 key=lambda item: _TYPE_ORDER.get(item[0], len(_TYPE_ORDER)),

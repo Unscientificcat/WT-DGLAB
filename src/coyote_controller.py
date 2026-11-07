@@ -26,6 +26,8 @@ from typing import Optional
 
 from .command_mailbox import CommandMailbox
 from .output_runtime import OutputRuntime
+from .output_coordinator import OutputCoordinator
+from .waveform_runtime import WaveformRuntime
 from .output_telemetry import OutputTelemetry
 from .waveforms import WaveformCatalog, WaveformPlayer
 
@@ -50,7 +52,7 @@ class CoyoteStatus:
 # 控制器
 # ============================================================
 
-class CoyoteController(OutputRuntime):
+class CoyoteController(OutputCoordinator, WaveformRuntime, OutputRuntime):
     """郊狼 3.0 控制器（线程安全）
 
     在后台线程运行 asyncio 事件循环和 WebSocket 服务端。
@@ -102,10 +104,17 @@ class CoyoteController(OutputRuntime):
         self._random_tasks: dict = {}  # {"A": task, "B": task}
         self._waveform_configs: dict[str, tuple] = {}
 
-        # 输出遥测（波形名 + 下发批次），供界面显示当前波形和电压曲线
+        # 输出遥测（波形名 + 下发批次），供界面显示波形和强度估算曲线
         self.telemetry = OutputTelemetry()
         self._feed_cursor = {"A": 0.0, "B": 0.0}
         self._init_output_runtime()
+        self._output_lock = self._command_lock
+        self._last_strength = self._channel_strength
+        self._batch_blocked = False
+        self._deferred_channels = set()
+        self._faulted = {"A": False, "B": False}
+        self._output_failures = 0
+        self._last_normal_timing = 0.0
         self._stop_future = None
         self._limits = {"A": None, "B": None}
         self._app_strength = {"A": None, "B": None}
@@ -510,6 +519,38 @@ class CoyoteController(OutputRuntime):
                         self._channel_strength[cmd[1]] = 0
                     raise
 
+    def _stop_key(self, channel):
+        """标识当前 V3 会话和通道停止代次。"""
+        return (self._session, id(self._client), None, self._epochs[channel])
+
+    def _new_session(self):
+        """新连接撤销旧故障和协调状态。"""
+        super()._new_session()
+        self._batch_blocked = False
+        self._deferred_channels.clear()
+        self._faulted = {"A": False, "B": False}
+        self._output_failures = 0
+
+    def _trace_stage(self, stage):
+        """保留协议无关的阶段诊断入口。"""
+        logger.debug("V3 输出阶段 session=%s stage=%s", self._session, stage)
+
+    async def _stop_batch(self, channels):
+        """分别尝试全部通道停止，任何失败都不能跳过另一通道。"""
+        results = await asyncio.gather(
+            *(self._stop_channel(ch) for ch in channels), return_exceptions=True)
+        errors = [r for r in results if isinstance(r, BaseException)]
+        if errors:
+            raise RuntimeError(f"V3 停止批次未确认：{errors}")
+
+    async def _execute_locked(self, command):
+        """协调器持有输出锁时执行 V3 协议操作。"""
+        await self._exec_locked(command)
+
+    async def _send_waveform(self, channel, strength):
+        """协调强度完成后补给首批波形。"""
+        await self._restart_channel(channel)
+
     async def _exec_locked(self, cmd: tuple):
         """将退出归零与业务指令串行化。"""
         from pydglab_ws import StrengthOperationType, Channel
@@ -524,25 +565,14 @@ class CoyoteController(OutputRuntime):
 
         if cmd_type == "waveform":
             channel_str = cmd[1]
-            name = cmd[2]
-            enabled = bool(cmd[3]) if len(cmd) > 3 else False
-            minimum = int(cmd[4]) if len(cmd) > 4 else 30
-            maximum = int(cmd[5]) if len(cmd) > 5 else minimum
-            config_key = (name, enabled, minimum, maximum)
-            if self._waveform_configs.get(channel_str) == config_key:
-                return
-            self._waveform_configs[channel_str] = config_key
-            self._stop_channel_random(channel_str)
-            player = self._player_a if channel_str == "A" else self._player_b
-            player.set_waveform(name)
-            self.telemetry.record_waveform(channel_str, player.current_name)
-            if enabled:
-                self._start_channel_random(channel_str, minimum, maximum)
-            if (self._is_feeding(channel_str)
+            changed = self._set_waveform(channel_str, cmd[2],
+                                         bool(cmd[3]) if len(cmd) > 3 else False,
+                                         int(cmd[4]) if len(cmd) > 4 else 30,
+                                         int(cmd[5]) if len(cmd) > 5 else 50)
+            if (changed and self._is_feeding(channel_str)
                     and not getattr(self, "_applying_intent", False)):
                 await self._restart_channel(channel_str)
             return
-
         if cmd_type != "strength":
             return
 
@@ -571,8 +601,9 @@ class CoyoteController(OutputRuntime):
         self._channel_errors[channel_str] = ""
         previous = self._channel_strength[channel_str]
         self._channel_strength[channel_str] = value
-        # 波形幅度随强度缩放：强度变化时替换队列；不变时交给 _pulse_feeder。
-        if value != previous or getattr(self, "_applying_intent", False):
+        # 强度变化时替换队列；波形百分比不随强度重复缩放。
+        if (not getattr(self, "_coordinating_output", False)
+                and (value != previous or getattr(self, "_applying_intent", False))):
             await self._restart_channel(channel_str)
 
     @staticmethod
@@ -584,6 +615,7 @@ class CoyoteController(OutputRuntime):
     def _reset_pulse_state(self) -> None:
         """绑定或断线时复位补给状态（设备端强度已归零 / 已失联）。"""
         self._channel_strength = {"A": 0, "B": 0}
+        self._last_strength = self._channel_strength
         self._next_feed = {"A": 0.0, "B": 0.0}
         self._needs_stop = {"A": False, "B": False}
 
@@ -612,6 +644,8 @@ class CoyoteController(OutputRuntime):
                 # 归零发送失败时也尽力清队列，避免补给后的旧波形继续播放。
                 await self._client.clear_pulses(channel)
         self._needs_stop[channel_str] = False
+        player = self._player_a if channel_str == "A" else self._player_b
+        player.reset()
         self.telemetry.record_silence(channel_str)
 
     async def _restart_channel(self, channel_str: str) -> None:
@@ -662,28 +696,8 @@ class CoyoteController(OutputRuntime):
                     logger.warning(f"波形补给失败: {e}", exc_info=True)
 
     def _build_pulse(self, channel_str: str, strength: int, at: float | None = None):
-        """从波形播放器取一帧，按强度缩放为 ((频率×4), (幅度×4))。"""
-        player = self._player_a if channel_str == "A" else self._player_b
-
-        if player.is_constant:
-            # 恒定模式：固定频率 + 均匀强度；强度 1~2 时幅度为零
-            wave_strength = max(0, min(100, strength // 2))
-            if strength <= 50:
-                freq = 10
-            elif strength <= 100:
-                freq = 15
-            else:
-                freq = 20
-            return ((freq, freq, freq, freq), (wave_strength,) * 4)
-
-        # 波形预设模式：取预设的 pulse，按当前强度缩放波形强度 (0-100)
-        pulse = player.pulse_at(at if at is not None else time.monotonic())
-        if pulse is None:
-            return None
-        freqs, strengths = pulse
-        scale = strength / 200.0
-        scaled = tuple(max(0, min(100, int(v * scale))) for v in strengths)
-        return (freqs, scaled)
+        """读取原始波形帧；通道强度不再重复衰减幅度。"""
+        return self._pulse_at(channel_str, at if at is not None else time.monotonic())
 
     async def _feed_channel(self, channel_str: str, strength: int,
                             feeds: int) -> None:
@@ -703,31 +717,3 @@ class CoyoteController(OutputRuntime):
                                             played_at=start + index * 0.1)
             self._feed_cursor[channel_str] = start + len(pulses) * 0.1
 
-    def _start_channel_random(self, ch: str, minimum: int, maximum: int):
-        """启动单通道随机波形切换"""
-        self._stop_channel_random(ch)
-        task = asyncio.ensure_future(self._channel_random_loop(ch, minimum, maximum))
-        self._random_tasks[ch] = task
-
-    def _stop_channel_random(self, ch: str):
-        task = self._random_tasks.pop(ch, None)
-        if task and not task.done():
-            task.cancel()
-
-    async def _channel_random_loop(self, ch: str, minimum: int, maximum: int):
-        """单通道随机波形切换循环"""
-        player = self._player_a if ch == "A" else self._player_b
-        while self._running:
-            await asyncio.sleep(random.uniform(max(5, minimum), max(maximum, minimum)))
-            choices = [item for item in self._catalog.choices() if item != "恒定"]
-            if not choices:
-                continue
-            new_name = random.choice([item for item in choices if item != player.current_name] or choices)
-            player.set_waveform(new_name)
-            self.telemetry.record_waveform(ch, player.current_name)
-            logger.info(f"随机波形: 通道{ch} → {new_name}")
-            if self._is_feeding(ch):
-                try:
-                    await self._restart_channel(ch)
-                except Exception as e:
-                    logger.warning(f"随机波形切换下发失败: {e}", exc_info=True)

@@ -16,6 +16,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import requests
@@ -54,6 +55,8 @@ class TankData:
     is_repairing: bool = False       # 是否维修中
     repair_time: float = 0.0         # 剩余维修秒数
     crew_alive: Optional[bool] = None  # 乘员是否存活（None=未知，字段缺失时不判定）
+    repair_supported: bool = False
+    damage_supported: bool = False
     damaged_parts: frozenset = field(default_factory=frozenset)  # 已损毁部件/乘员名集合
 
 
@@ -65,10 +68,18 @@ class GameState:
     vehicle_type: str = ""           # "aircraft" / "tank" / "" (未知)
     aircraft: Optional[AircraftData] = None
     tank: Optional[TankData] = None
+    mission_status: str = "inactive"  # active / inactive / unknown
+    hud_success: bool = False
+    hud_records: tuple = ()
+    hud_sampled_at: float | None = None
+    endpoint_times: tuple = ()
     raw_state: dict = field(default_factory=dict)
     raw_indicators: dict = field(default_factory=dict)
     raw_map_info: dict = field(default_factory=dict)
     sampled_at: float | None = None  # 后台采样完成时刻，跨 GUI 队列保持原始有效期
+    # 由主程序采样时填入，读取器不依赖设备；防止排队期间连接后补发旧事件。
+    event_session: tuple[int, int] | None = None
+    event_output_bound: bool | None = None
 
 
 # ============================================================
@@ -102,6 +113,82 @@ class GameReader:
         self._endpoint_states = {}
         self._hud_local = threading.local()
         self._last_mission_state = None
+        self._pool = None
+        self._worker_sessions = {}
+        self._session_lock = threading.Lock()
+
+    def _collect_endpoint(self, url):
+        """一个工作线程独占一个 Session，记录各端点的完成时刻。"""
+        identity = threading.get_ident()
+        with self._session_lock:
+            session = self._worker_sessions.get(identity)
+            if session is None:
+                session = requests.Session()
+                session.trust_env = False
+                session.proxies = {"http": None, "https": None}
+                self._worker_sessions[identity] = session
+        started = time.monotonic()
+        data = self._fetch_json(
+            session, url, params={"lastEvt": 0, "lastDmg": 0}
+            if url == self.HUDMSG_URL else None)
+        return data, started, time.monotonic()
+
+    def collect(self) -> GameState:
+        """并发采集完整一批遥测和 HUD；请求失败与明确退出分别表达。"""
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(max_workers=4,
+                                            thread_name_prefix="8111接口")
+        urls = (self.STATE_URL, self.INDICATORS_URL,
+                self.MAP_INFO_URL, self.HUDMSG_URL)
+        futures = {url: self._pool.submit(self._collect_endpoint, url)
+                   for url in urls}
+        results = {}
+        for url, future in futures.items():
+            try:
+                results[url] = future.result()
+            except Exception:
+                logger.exception("8111 采集工作线程异常：%s", url)
+                results[url] = (None, time.monotonic(), time.monotonic())
+        raw, ind, mission, hud = (results[url][0] for url in urls)
+        state = GameState(
+            link_ok=raw is not None, raw_state=raw or {},
+            raw_indicators=ind or {}, raw_map_info=mission or {},
+            sampled_at=min(results[url][2] for url in urls[:3]),
+            hud_sampled_at=results[self.HUDMSG_URL][2],
+            endpoint_times=tuple((url, *results[url][1:]) for url in urls),
+        )
+        if mission is not None and mission.get("valid") is False:
+            state.mission_status = "inactive"
+        elif mission is not None and self._is_active_mission(mission):
+            state.mission_status = "active"
+        else:
+            state.mission_status = "unknown"
+        state.connected = state.mission_status == "active" and raw is not None
+        state.vehicle_type = self._detect_vehicle_type(raw or {}, ind or {})
+        if state.vehicle_type == "tank" and ind is not None:
+            state.tank = self._parse_tank(raw or {}, ind)
+        elif state.vehicle_type == "aircraft" and raw is not None:
+            state.aircraft = self._parse_aircraft(raw)
+        records = hud.get("damage") if hud is not None else None
+        state.hud_success = isinstance(records, list)
+        state.hud_records = tuple(records) if state.hud_success else ()
+        if hud is not None and not state.hud_success:
+            self._report_endpoint(self.HUDMSG_URL + "#damage", "invalid_damage",
+                                  "damage 字段不是列表", failed=True)
+        return state
+
+    def close(self) -> None:
+        """等待有界采集任务结束并释放全部 HTTP 连接。"""
+        if self._pool is not None:
+            self._pool.shutdown(wait=True, cancel_futures=True)
+            self._pool = None
+        with self._session_lock:
+            for session in self._worker_sessions.values():
+                session.close()
+            self._worker_sessions.clear()
+        self._session.close()
+        if hasattr(self._hud_local, "session"):
+            self._hud_local.session.close()
 
     def _report_endpoint(self, url, key, message, *, failed=False) -> None:
         """按接口和原因去重，耗时变化本身不触发重复日志。"""
@@ -247,6 +334,7 @@ class GameReader:
             return state
 
         state.connected = True
+        state.mission_status = "active"
 
         # 同时获取 indicators（陆战中 state 可能为 {"valid": false}，但 indicators 有数据）
         state.raw_indicators = self._fetch_json(self._session, self.INDICATORS_URL) or {}
@@ -369,6 +457,9 @@ class GameReader:
         if ny is not None:
             try:
                 data.gforce = abs(float(ny))
+                if not math.isfinite(data.gforce):
+                    data.valid = False
+                    data.gforce = 0.0
             except (ValueError, TypeError):
                 data.gforce = 0.0
 
@@ -403,6 +494,8 @@ class GameReader:
         """解析坦克状态 — 提取速度、乘员存活与部件损伤数据"""
         data = TankData()
         data.valid = bool(indicators_json.get("valid", False))
+        data.repair_supported = "is_repairing" in indicators_json
+        data.damage_supported = any(k.endswith("_state") for k in indicators_json)
         data.vehicle_name = str(indicators_json.get("type", ""))
 
         if indicators_json:
@@ -417,10 +510,11 @@ class GameReader:
             # 当前乘员数为 0 视为被击毁；字段缺失时保持 None 不判定。
             crew_total = self._safe_float(
                 indicators_json.get("crew_total"), 0.0)
-            if crew_total > 0:
+            if crew_total > 0 and "crew_current" in indicators_json:
                 crew_current = self._safe_float(
-                    indicators_json.get("crew_current"), crew_total)
-                data.crew_alive = crew_current > 0
+                    indicators_json["crew_current"], float("nan"))
+                if math.isfinite(crew_current) and crew_current >= 0:
+                    data.crew_alive = crew_current > 0
             # 部件/乘员损伤集合：供主控制器做帧间差分检测损伤边沿。
             data.damaged_parts = frozenset(
                 part.name for part in self._extract_damage_from_indicators(
@@ -460,7 +554,7 @@ class GameReader:
             if field in indicators_json:
                 val = indicators_json[field]
                 # _state 字段：0=完好，非0=损毁
-                destroyed = (abs(float(val)) > 0.001)
+                destroyed = (abs(self._safe_float(val)) > 0.001)
                 part = TankDamagePart(
                     name=display_name,
                     health=0.0 if destroyed else 100.0,
@@ -481,7 +575,7 @@ class GameReader:
         for field, display_name in module_fields:
             if field in indicators_json:
                 val = indicators_json[field]
-                destroyed = (abs(float(val)) > 0.001)
+                destroyed = (abs(self._safe_float(val)) > 0.001)
                 part = TankDamagePart(
                     name=display_name,
                     health=0.0 if destroyed else 100.0,

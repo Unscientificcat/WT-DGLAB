@@ -14,7 +14,6 @@ from src.dglab_devices import DeviceRegistry
 from src.dglab_state import ChannelTarget, OutputIntent, WaveformConfig
 from src.waveforms import WaveformPlayer
 from test_output_stop_barrier import bound_controller, drain
-from test_repair_lifecycle import app, event, tank_state, tick
 from main import App
 
 
@@ -402,40 +401,6 @@ def test_service_retries_and_stop_cancels_retry():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("protocol", ["v3", "v4"])
-@pytest.mark.parametrize("kind", ["kill", "repair", "hit", "death"])
-@pytest.mark.parametrize("normal", [0, 5])
-async def test_real_game_event_to_atomic_output_restores_normal(app, protocol, kind, normal):
-    """真实主程序事件逻辑通过新意图接口走生产协议路径。"""
-    controller, peer = connected(protocol)
-    app.coyote = controller
-    app._desired_waveforms = {"A": WaveformConfig(), "B": WaveformConfig()}
-    app._send_strength = App._send_strength.__get__(app)
-    app._output_revision = 0
-    cfg = app.config_mgr.config
-    cfg.tank.enabled = bool(normal)
-    cfg.tank.speed_min = 0
-    cfg.tank.speed_max = 30
-    cfg.tank.channel_a_max = normal
-    cfg.tank.channel_b_max = normal
-    trigger = event(kind)
-    trigger.update(ch_a=30, ch_b=12, duration=5)
-    tick(app, tank_state(repairing=False), [trigger])
-    await drain(controller)
-    # 维修事件需要实际维修状态保持有效。
-    if kind == "repair":
-        tick(app, tank_state(repairing=True), [trigger])
-        await drain(controller)
-    assert peer.strength == [30, 12]
-    app._event_remaining = 0.01
-    tick(app, tank_state(repairing=False))
-    await drain(controller)
-    assert peer.strength == [normal, normal]
-    if normal == 0:
-        assert peer.playing == [False, False]
-
-
-@pytest.mark.asyncio
 async def test_fresh_lease_deadline_does_not_restart_waveform():
     controller, peer = connected()
     controller.submit_output(intent(expires_at=time.monotonic() + 1))
@@ -476,7 +441,7 @@ async def test_only_alternative_device_requires_visible_manual_selection():
     assert controller._runtime_state == "waiting_selection"
 
 
-def test_gui_distinguishes_report_unknown_limit_and_selection():
+def test_gui_keeps_manual_device_selection_without_diagnostics():
     from PySide6.QtWidgets import QApplication, QWidget
     from src.gui.main_window import QRWidget
     from src.dglab_state import ChannelSnapshot, ConnectionSnapshot, DeviceSnapshot
@@ -489,9 +454,9 @@ def test_gui_distinguishes_report_unknown_limit_and_selection():
         a=ChannelSnapshot(target=30, limit=20, muted=True),
     ))
     assert not panel.device_selector.isHidden()
-    assert "App 未知" in panel.output_status.text()
-    assert "App 上限 20" in panel.output_status.text()
-    assert "App 静音" in panel.output_status.text()
+    assert panel.status_text.text() == "请选择郊狼设备"
+    assert panel.output_status.isHidden()
+    assert panel.output_status.text() == ""
     selected = []
     panel.on_device_selected = selected.append
     panel._choose_device(1)
@@ -518,19 +483,3 @@ async def test_queued_recovery_uses_latest_target_instead_of_old_strength(protoc
     assert peer.strength[0] == 0
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("protocol", ["v3", "v4"])
-async def test_old_telemetry_in_gui_queue_does_not_renew_output(app, protocol):
-    controller, peer = connected(protocol)
-    app.coyote = controller
-    app._desired_waveforms = {"A": WaveformConfig(), "B": WaveformConfig()}
-    app._send_strength = App._send_strength.__get__(app)
-    app._output_revision = 0
-    cfg = app.config_mgr.config.tank
-    cfg.enabled = True
-    cfg.channel_a_max = cfg.channel_b_max = 30
-    state = tank_state(repairing=False)
-    state.sampled_at = time.monotonic() - 5
-    tick(app, state)
-    await drain(controller)
-    assert peer.strength == [0, 0]

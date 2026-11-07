@@ -47,6 +47,9 @@ class OutputRuntime:
         with self._intent_lock:
             if not self._running or self._closing or not self._status.bound:
                 return
+            if (intent.expected_session is not None
+                    and intent.expected_session != self._session):
+                return
             until = min(now + 1.0, intent.expires_at if intent.expires_at is not None else float("inf"))
             if until <= now:
                 return
@@ -111,51 +114,6 @@ class OutputRuntime:
             else:
                 value = self._targets[channel]
             return ("strength", channel, value)
-
-    async def _execute_intent(self, command, execute):
-        _, _, intent, session, revision, epochs = command
-        for channel, target in (("A", intent.a), ("B", intent.b)):
-            with self._intent_lock:
-                # A 等待网络响应时 B 仍应取得最新采样，不能因每帧修订而饥饿。
-                if self._intent is not None:
-                    intent = self._intent
-                    target = intent.a if channel == "A" else intent.b
-                    revision = self._revision
-                valid = (session == self._session
-                         and epochs[channel] == self._epochs[channel]
-                         and self._output_allowed(channel))
-            if not valid:
-                continue
-            if (target == self._applied_targets[channel]
-                    and not self._needs_stop[channel]
-                    and not self._cmd_queue.has_stop(channel)):
-                continue
-            self._targets[channel] = max(0, min(200, int(target.strength)))
-            logger.debug("输出意图 session=%s revision=%s source=%s ch=%s target=%s",
-                         session, revision, intent.source, channel, target.strength)
-            wf = target.waveform
-            try:
-                # 执行新波形配置时禁止沿用旧强度立即补给，由后续强度步骤统一下发。
-                self._applying_intent = True
-                await execute(("waveform", channel, wf.name, wf.random_enabled,
-                               wf.random_min, wf.random_max))
-                if (session == self._session and revision == self._revision
-                        and epochs[channel] == self._epochs[channel]
-                        and self._output_allowed(channel)):
-                    await execute(("strength", channel, target.strength))
-                    if session == self._session and epochs[channel] == self._epochs[channel]:
-                        self._applied_targets[channel] = target
-            except Exception as error:
-                logger.exception("输出失败 session=%s ch=%s", session, channel)
-                if session != self._session:
-                    continue
-                self._needs_stop[channel] = True
-                self._channel_errors[channel] = str(error)
-                self._cmd_queue.put_stop(channel)
-                if hasattr(self, "_queue_latest_target"):
-                    self._queue_latest_target(channel)
-            finally:
-                self._applying_intent = False
 
     async def _runtime_watchdog(self):
         """独立于 GUI 和网络等待，每 25ms 检查输出期限并发布状态。"""

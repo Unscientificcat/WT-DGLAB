@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-<img src="https://img.shields.io/badge/version-v1.1.2-4f8fe8" alt="版本 v1.1.2">
+<img src="https://img.shields.io/badge/version-v1.1.5-4f8fe8" alt="版本 v1.1.5">
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-2d7dd2" alt="Windows 10 / 11">
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776ab" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/DG--LAB%20App-V3%20%2F%20V4-ef6f91" alt="DG-LAB App V3 / V4">
@@ -26,7 +26,11 @@
 
 本项目是一个 Vibe Coding 实践作品，代码、协议判断和安全行为仍应以实际测试结果为准。
 
-当前版本为 `v1.1.2`。协议、界面和自动化回归已经验证；DG-LAB 4.x App 与实际郊狼设备的完整实机联调仍在进行中，请谨慎测试。
+当前版本为 `v1.1.5`。协议、界面和自动化回归已经验证；DG-LAB 4.x App 与实际郊狼设备的完整实机联调仍在进行中，请谨慎测试。
+
+## 当前源码重构（2026-10-31）
+
+v1.1.5 已包含本次源码重构：后台统一采集、事件仲裁和 V3/V4 共用输出协调。恒定波形固定 10 Hz、100% 幅度，自定义波形保留原曲线。可使用 v1.1.5 目录包，或从项目根目录运行 `py -3.14 main.py`。实现、验证范围与实机步骤见 [触发与输出重构](docs/trigger-output-refactor.md)。
 
 ## 功能
 
@@ -86,7 +90,7 @@
 
 ### 使用发布版 EXE
 
-1. 从 GitHub Releases 下载 `WT-DGLAB v1.1.2.zip` 并完整解压。
+1. 从 GitHub Releases 下载 `WT-DGLAB v1.1.5.zip` 并完整解压。
 2. 启动《战争雷霆》，进入机库或对局。
 3. 运行目录中的 `WT-DGLAB.exe`，阅读并确认注意事项。
 4. 在右侧“连接郊狼”区域选择 `V3 App` 或 `V4 App`。
@@ -197,7 +201,7 @@ value >= max  -> channel_max
 
 ### 连接重构后的状态与事件停止（当前源码）
 
-右侧显示目标强度、App 实际上报及更新时间；“未知”表示尚未收到报告。多个 V4 设备需要手动选择，设备离线不会自动转到另一台。静音和上限由 App 决定，程序不会提高 App 的上限。
+右侧连接成功后仅显示“已连接”，不展示地址、通道上报或原始异常详情。未连接时保留二维码、简短状态及必要的 V4 设备选择；诊断信息可在运行日志中查看。设备离线不会自动转到另一台，App 静音与上限仍然有效。
 
 事件结束时先清理事件输出；当前速度/过载仍对应非零目标时，会恢复常态强度与波形。连续停止/恢复失败会显示通道错误，请检查 App 并重新连接。详细复测步骤见 [连接重构与实机验收](docs/connection-refactor.md)。
 
@@ -243,7 +247,7 @@ python -m pytest -q
 python build.py
 ```
 
-打包脚本使用 PyInstaller `--onedir --windowed`，在 `dist/` 生成 `WT-DGLAB v1.1.2/` 目录及同名 ZIP。目录包含 `WT-DGLAB.exe`、`_internal/`、`resources/`、安全默认模板、README 和 LICENSE。用户配置只保存在 EXE 同目录的 `config.json`；新版本不会自动迁移旧目录配置。
+打包脚本使用 PyInstaller `--onedir --windowed`，在 `dist/` 生成 `WT-DGLAB v1.1.5/` 目录及同名 ZIP。目录包含 `WT-DGLAB.exe`、`_internal/`、`resources/`、安全默认模板、README 和 LICENSE。用户配置只保存在 EXE 同目录的 `config.json`；新版本不会自动迁移旧目录配置。
 
 ## 架构
 
@@ -287,6 +291,26 @@ python build.py
 更详细的技术资料见 [docs/tech-spec.md](docs/tech-spec.md)、[docs/ui-redesign.md](docs/ui-redesign.md) 和 [docs/v4-app-adaptation.md](docs/v4-app-adaptation.md)。
 
 ## 更新日志
+
+### v1.1.5
+
+- 连接成功后，连接状态区域仅显示“已连接”，收起二维码及诊断信息；未连接时保留必要的连接操作。
+- 包含后台事件统一仲裁、独立期限和 V3/V4 共用输出协调重构。
+- 恒定波形固定 10 Hz、100% 幅度，自定义波形保留原曲线；手机与设备实机验收仍需单独进行。
+
+### v1.1.4
+
+- 修复重进试驾后事件 ID 被复用造成的漏触发：持续读取完整 HUD，并比较同 ID 的时间和文本变化；保留历史去重和设备输出资格规则。
+- 优化 V4 事件输出切换：双通道并行停止、同代次停止确认复用，强度确认后协调发送首批波形，减少串行等待。
+- 增加 HUD 真实记录回放、V3/V4 事件集成和 V4 延迟／故障回归；当前源码完整回归 591 项通过，实际游戏与设备效果仍需现场验收。
+
+
+### v1.1.3
+
+- 修复未连接设备时事件不显示：击杀、坠毁／被摧毁、维修和部件损伤均可在主界面与悬浮窗预览。
+- 事件预览中途连接或重连设备，不补发旧事件；旧预览结束后恢复当前常规映射，维修恢复沿用原输出资格。
+- 有限事件倒计时与设备输出共用原始截止时间，避免排队或窗口停顿延长事件；提交输出时再次校验连接会话。
+- 新增 64 项专项回归，完整 534 项测试通过；Windows 原生界面真实 HUD 回放验证通过，手机与设备实机验收仍待完成。
 
 ### v1.1.2
 
@@ -422,7 +446,7 @@ python build.py
 
 - `config.json` 可能包含玩家昵称和个人强度设置，公开仓库前应确认其中没有隐私信息。
 - `wt-dglab-trace.log` 属于诊断日志，不应作为正式发布内容。
-- 建议通过 GitHub Releases 分发 `WT-DGLAB v1.1.2.zip`，不要要求普通用户从源码构建。
+- 建议通过 GitHub Releases 分发 `WT-DGLAB v1.1.5.zip`，不要要求普通用户从源码构建。
 
 ## 相关资料
 

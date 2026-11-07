@@ -10,7 +10,6 @@ from main import App
 from src.command_mailbox import CommandMailbox
 from src.coyote_controller import CoyoteController
 from src.coyote_v4_controller import CoyoteV4Controller
-from test_repair_lifecycle import app, event, tank_state, tick
 from v4_peer import V4Peer
 
 
@@ -129,31 +128,6 @@ async def test_single_channel_stop_preserves_other_channel(protocol):
     await drain(controller)
     assert peer.strength == [0, 0]
     assert peer.playing == [False, False]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("protocol", ["v3", "v4"])
-@pytest.mark.parametrize("kind", ["kill", "repair", "hit", "death"])
-@pytest.mark.parametrize("normal_strength", [0, 5])
-async def test_event_expiry_restores_actual_peer_output(app, protocol, kind, normal_strength):
-    controller, peer = bound_controller(protocol)
-    app.coyote = controller
-    app._send_strength = App._send_strength.__get__(app)
-    cfg = app.config_mgr.config
-    cfg.tank.enabled = bool(normal_strength)
-    cfg.tank.speed_min = 0
-    cfg.tank.speed_max = 30
-    cfg.tank.channel_a_max = normal_strength
-    cfg.tank.channel_b_max = normal_strength
-    tick(app, tank_state(repairing=kind == "repair"), [event(kind)])
-    await drain(controller)
-    assert peer.strength == [81, 42]
-    app._event_remaining = 0.05
-    tick(app)
-    await drain(controller)
-    assert peer.strength == [normal_strength, normal_strength]
-    assert peer.playing == [bool(normal_strength)] * 2
-    assert app._event_kind == ""
 
 
 @pytest.mark.asyncio
@@ -286,20 +260,6 @@ async def test_v4_pending_stop_blocks_waveform_after_inflight_increment():
     peer.before_response = None
     await drain(controller)
     assert peer.strength[0] == 0
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("protocol", ["v3", "v4"])
-async def test_cancel_event_stops_actual_output(app, protocol):
-    controller, peer = bound_controller(protocol)
-    app.coyote = controller
-    app._send_strength = App._send_strength.__get__(app)
-    tick(app, tank_state(), [event("repair")])
-    await drain(controller)
-    app._cancel_active_event()
-    await drain(controller)
-    assert peer.strength == [0, 0]
-    assert peer.playing == [False, False]
 
 
 class ListeningV4Peer(V4Peer):

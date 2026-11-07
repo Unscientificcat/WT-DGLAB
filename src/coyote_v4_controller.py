@@ -17,6 +17,8 @@ import websockets
 from .coyote_controller import CoyoteStatus
 from .command_mailbox import CommandMailbox
 from .output_runtime import OutputRuntime
+from .output_coordinator import OutputCoordinator
+from .waveform_runtime import WaveformRuntime
 from .dglab_devices import DeviceRegistry
 from .dglab_rpc import V4Rpc
 from .output_telemetry import OutputTelemetry
@@ -30,7 +32,7 @@ PAIRING_URL_PREFIX = "https://dungeon-lab.cn/s/?v=1&action=socket&url="
 COYOTE_DEVICE_TYPES = {"COYOTE_020", "COYOTE_030"}
 
 
-class CoyoteV4Controller(OutputRuntime):
+class CoyoteV4Controller(OutputCoordinator, WaveformRuntime, OutputRuntime):
     """通过 V4 Relay 控制 DG-LAB 4.x App 暴露的郊狼设备。"""
 
     # 发出增量 / 归零后暂不信任 App 上报的时长（秒）
@@ -43,7 +45,7 @@ class CoyoteV4Controller(OutputRuntime):
         self._relay_url = self.normalize_relay_url(relay_url)
         self._status = CoyoteStatus()
         # 同一 (类型, 通道) 只保留最新命令，避免积压和回放过期强度
-        self._cmd_queue = CommandMailbox()
+        self._cmd_queue = CommandMailbox(batch_stops=True)
         self._result_queue: queue.Queue = queue.Queue()
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -79,7 +81,7 @@ class CoyoteV4Controller(OutputRuntime):
         self._random_tasks: dict[str, asyncio.Task] = {}
         self._waveform_configs: dict[str, tuple] = {}
 
-        # 输出遥测（波形名 + 下发批次），供界面显示当前波形和电压曲线
+        # 输出遥测（波形名 + 下发批次），供界面显示当前波形和强度曲线
         self.telemetry = OutputTelemetry()
         self._init_output_runtime()
         self._stop_future = None
@@ -96,6 +98,12 @@ class CoyoteV4Controller(OutputRuntime):
         self._failures = {"A": 0, "B": 0}
         self._strength_failures = {"A": 0, "B": 0}
         self._faulted = {"A": False, "B": False}
+        self._stop_confirmed = {"A": None, "B": None}
+        self._batch_blocked = False
+        self._latency_trace = None
+        self._last_normal_timing = 0.0
+        self._output_failures = 0
+        self._deferred_channels = set()
 
     @property
     def status(self) -> CoyoteStatus:
@@ -174,11 +182,13 @@ class CoyoteV4Controller(OutputRuntime):
 
     def stop_output(self, channel: str | None = None) -> None:
         """提交单通道或双通道停止屏障，保留屏障之后的恢复命令。"""
-        self._invalidate_output(channel)
-        if self._running and not self._closing:
-            for name in ((channel,) if channel else ("A", "B")):
-                self._cmd_queue.put_stop(name)
-                logger.info("V4 %s 提交停止屏障", name)
+        with self._intent_lock:
+            self._invalidate_output(channel)
+            if self._running and not self._closing:
+                channels = (channel,) if channel else ("A", "B")
+                self._cmd_queue.put_stops(channels)
+                for name in channels:
+                    logger.info("V4 %s 提交停止屏障", name)
 
     def set_waveform_a(self, name: str, random_enabled: bool = False,
                        random_min: int = 30, random_max: int = 50) -> None:
@@ -217,12 +227,8 @@ class CoyoteV4Controller(OutputRuntime):
 
     @staticmethod
     def scaled_amplitudes(pulse, strength: int) -> tuple[int, ...]:
-        """将项目波形帧幅度按强度比例缩放为 0-100 的最终幅度。"""
-        _frequencies, amplitudes = pulse
-        scale = CoyoteV4Controller._clamp_strength(strength) / 200.0
-        return tuple(
-            max(0, min(100, int(value * scale))) for value in amplitudes
-        )
+        """兼容帧编码入口，返回原始幅度百分比，不随通道强度缩放。"""
+        return tuple(max(0, min(100, int(value))) for value in pulse[1])
 
     @staticmethod
     def pulse_to_hex(pulse, strength: int) -> str:
@@ -508,6 +514,20 @@ class CoyoteV4Controller(OutputRuntime):
                             self._session, channel, value, self._last_strength[channel])
             self._app_strength[channel] = value
             self._reported_at[channel] = now
+            if value != self._last_strength[channel]:
+                self._stop_confirmed[channel] = None
+            trace = self._latency_trace
+            if (trace is not None and trace["session"] == self._session
+                    and "强度确认" in trace["stages"]
+                    and self._intent is not None and self._intent.source == trace["source"]
+                    and channel not in trace["reports"] and value > 0
+                    and value == self._last_strength[channel]
+                    and value == self._targets[channel]
+                    and not self._needs_stop[channel]
+                    and not self._cmd_queue.has_stop(channel)
+                    and self._output_allowed(channel)):
+                trace["reports"].add(channel)
+                self._trace_stage(f"{channel}目标匹配上报（非执行回执）")
             if self._needs_stop[channel] or now < self._calib_block_until[channel]:
                 # 可能是发送前的旧值：暂存用于诊断，但不能因时间过去就信任它。
                 self._pending_report[channel] = value
@@ -620,12 +640,25 @@ class CoyoteV4Controller(OutputRuntime):
                 await asyncio.sleep(0.05)
                 continue
 
+            session = self._session
             try:
                 await self._execute_command(command)
             except Exception as error:
+                if session != self._session:
+                    continue
                 self._status.error = str(error)
                 logger.warning(f"V4 指令失败: {error}", exc_info=True)
-                if self._status.bound and command[0] in {"stop", "strength"}:
+                if self._status.bound and command[0] == "stop_batch":
+                    channels = command[2]
+                    for channel in channels:
+                        if self._needs_stop[channel]:
+                            self._failures[channel] += 1
+                            if self._failures[channel] >= 3:
+                                self._faulted[channel] = True
+                                self._channel_errors[channel] = "停止未确认，请检查 App 并重新连接"
+                    if not any(self._faulted[ch] for ch in channels):
+                        self._cmd_queue.put_stops(channels)
+                elif self._status.bound and command[0] in {"stop", "strength"}:
                     self._needs_stop[command[1]] = True
                     channel = command[1]
                     self._failures[channel] += 1
@@ -650,7 +683,91 @@ class CoyoteV4Controller(OutputRuntime):
             return
         async with self._output_lock:
             if not self._closing:
-                await self._execute_locked(command)
+                if command[0] == "stop_batch":
+                    await self._stop_batch(command[2])
+                else:
+                    await self._execute_locked(command)
+
+    def _stop_key(self, channel):
+        """停止确认仅在当前连接、设备和通道代次有效。"""
+        return (self._session, self._client_id, self._slot_id,
+                self._epochs[channel])
+
+    def _new_session(self):
+        """连接代次变化后撤销停止证明与延迟关联。"""
+        super()._new_session()
+        self._stop_confirmed = {"A": None, "B": None}
+        self._batch_blocked = False
+        self._output_failures = 0
+        self._latency_trace = None
+        self._deferred_channels = set()
+
+    def submit_output(self, intent):
+        """提交输出并为事件记录一次分段计时上下文。"""
+        with self._intent_lock:
+            super().submit_output(intent)
+            if self._intent is not intent:
+                return
+            trace = self._latency_trace
+            if not intent.source.startswith("event:"):
+                self._latency_trace = None
+                return
+            if trace is None or (trace["session"], trace["source"]) != (self._session, intent.source):
+                self._latency_trace = {
+                    "session": self._session, "source": intent.source,
+                    "revision": self._revision, "submitted": time.monotonic(),
+                    "identified": intent.identified_at, "stages": set(),
+                    "reports": set(),
+                }
+                self._trace_stage("提交")
+
+    def _trace_stage(self, stage):
+        """事件阶段只记录一次；上报匹配不代表硬件开始输出。"""
+        with self._intent_lock:
+            trace = self._latency_trace
+            if (trace is None or trace["session"] != self._session
+                    or self._intent is None or trace["source"] != self._intent.source
+                    or stage in trace["stages"]):
+                return
+            trace["stages"].add(stage)
+            now = time.monotonic()
+            identified = trace["identified"]
+            logger.info("V4 事件计时 session=%s source=%s revision=%s stage=%s "
+                        "提交后=%.3fs 识别后=%s",
+                        self._session, trace["source"], trace["revision"], stage,
+                        now - trace["submitted"],
+                        "未知" if identified is None else f"{now - identified:.3f}s")
+
+    async def _stop_batch(self, channels):
+        """调用方持有输出锁；通道内部有序，通道之间并行等待。"""
+        channels = tuple(channels)
+        session = self._session
+        keys = {ch: self._stop_key(ch) for ch in channels}
+        started = time.monotonic()
+        if len(channels) == 2:
+            self._batch_blocked = True
+        for channel in channels:
+            self._needs_stop[channel] = True
+            self._stop_confirmed[channel] = None
+        async def stop_current(channel):
+            # A 的 await 可能使会话变化，B 协程启动时仍须核对批次来源。
+            if keys[channel] != self._stop_key(channel):
+                raise ConnectionError("停止批次已被新连接或新停止取代")
+            await self._stop_channel(channel)
+
+        results = await asyncio.gather(
+            *(stop_current(ch) for ch in channels), return_exceptions=True)
+        if session != self._session:
+            raise ConnectionError("停止批次所属会话已失效")
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            raise RuntimeError(f"V4 停止批次未确认: {errors}")
+        if all(keys[ch] == self._stop_key(ch) for ch in channels):
+            if len(channels) == 2:
+                self._batch_blocked = False
+            logger.info("V4 停止批次完成 session=%s channels=%s elapsed=%.3f",
+                        session, channels, time.monotonic() - started)
+            self._trace_stage("双通道停止完成")
 
     async def _execute_locked(self, command: tuple) -> None:
         """在同一输出锁内处理强度、停止和换波，防止随机任务插入。"""
@@ -659,6 +776,12 @@ class CoyoteV4Controller(OutputRuntime):
         if command_type == "stop":
             if self._status.bound:
                 await self._stop_channel(channel)
+                if (self._batch_blocked
+                        and all(self._stop_confirmed[ch] == self._stop_key(ch)
+                                and not self._needs_stop[ch]
+                                and not self._cmd_queue.has_stop(ch)
+                                for ch in ("A", "B"))):
+                    self._batch_blocked = False
                 logger.info("V4 %s 通道停止屏障已执行", channel)
             return
         if command_type == "waveform":
@@ -683,12 +806,22 @@ class CoyoteV4Controller(OutputRuntime):
         if self._muted[channel] or self._faulted[channel]:
             target = 0
         if target == 0:
+            if (getattr(self, "_coordinating_output", False)
+                    and not self._needs_stop[channel]
+                    and not self._cmd_queue.has_stop(channel)
+                    and self._stop_confirmed[channel] == self._stop_key(channel)):
+                return
             await self._stop_channel(channel)
             return
-        if self._cmd_queue.has_stop(channel) or not self._output_allowed(channel):
+        if (self._batch_blocked or self._cmd_queue.has_stop(channel)
+                or not self._output_allowed(channel)):
             return
+        key = self._stop_key(channel)
         if self._needs_stop[channel]:
             await self._stop_channel(channel)
+            if (key != self._stop_key(channel) or self._cmd_queue.has_stop(channel)
+                    or not self._output_allowed(channel)):
+                return
         previous = self._last_strength[channel]
         if target != previous:
             # 增量必须收到完成响应后才能成为下一次运算基准。
@@ -699,6 +832,8 @@ class CoyoteV4Controller(OutputRuntime):
                     "im": True,
                 })
             except Exception:
+                if key[:3] != self._stop_key(channel)[:3]:
+                    raise
                 self._needs_stop[channel] = True
                 self._strength_failures[channel] += 1
                 if self._strength_failures[channel] >= 3:
@@ -711,38 +846,23 @@ class CoyoteV4Controller(OutputRuntime):
             # App 上报保持独立，完成响应只更新命令基准。
 
         if (target > 0 and not self._cmd_queue.has_stop(channel)
+                and not getattr(self, "_coordinating_output", False)
                 and self._output_allowed(channel)
                 and (target != previous or getattr(self, "_applying_intent", False))):
             await self._send_waveform(channel, target)
 
-    def _set_waveform(self, channel: str, name: str, enabled: bool = False,
-                      minimum: int = 30, maximum: int = 50) -> bool:
-        """更新本地波形播放器和随机切换任务，返回配置是否发生变化。"""
-        config_key = (name, enabled, minimum, maximum)
-        if self._waveform_configs.get(channel) == config_key:
-            return False
-        self._waveform_configs[channel] = config_key
-        player = self._player_a if channel == "A" else self._player_b
-        self._stop_random_task(channel)
-        player.set_waveform(name)
-        self.telemetry.record_waveform(channel, player.current_name)
-        if enabled:
-            self._start_random_task(channel, minimum, maximum)
-        return True
-
     async def _send_waveform(self, channel: str, strength: int) -> None:
         """下发一秒可立即替换的 V4 郊狼波形任务。"""
-        if not self._output_allowed(channel) or self._needs_stop[channel]:
+        if (self._batch_blocked or not self._output_allowed(channel)
+                or self._needs_stop[channel]
+                or (channel in self._deferred_channels
+                    and not getattr(self, "_coordinating_output", False))):
             return
         player = self._player_a if channel == "A" else self._player_b
         started = time.monotonic()
         pulses = []
         for index in range(10):
-            if player.is_constant:
-                frequency = 10 if strength <= 50 else 15 if strength <= 100 else 20
-                pulse = ((frequency,) * 4, (100,) * 4)
-            else:
-                pulse = player.pulse_at(started + index * 0.1)
+            pulse = self._pulse_at(channel, started + index * 0.1)
             if pulse is not None:
                 pulses.append(pulse)
         await self._send_operation(channel, {
@@ -797,6 +917,9 @@ class CoyoteV4Controller(OutputRuntime):
     async def _stop_channel(self, channel: str) -> None:
         """先清除旧任务，再确认绝对归零；失败时禁止恢复输出。"""
         self._needs_stop[channel] = True
+        self._stop_confirmed[channel] = None
+        key = self._stop_key(channel)
+        self._applied_targets[channel] = None
         started = time.monotonic()
         baseline = self._last_strength[channel]
         self._last_strength[channel] = 0
@@ -808,15 +931,25 @@ class CoyoteV4Controller(OutputRuntime):
         except Exception as error:
             logger.warning("V4 %s 清任务失败: %r", channel, error)
             errors.append(error)
+        if key[:3] != self._stop_key(channel)[:3]:
+            raise ConnectionError("清任务期间连接或设备已变化")
         try:
             await self._reset_channel(channel)
         except Exception as error:
             logger.warning("V4 %s 绝对归零失败: %r", channel, error)
             errors.append(error)
+        if key[:3] != self._stop_key(channel)[:3]:
+            raise ConnectionError("归零期间连接或设备已变化")
         if errors:
             self._app_strength[channel] = None
             raise RuntimeError(f"V4 {channel} 停止未确认: {errors}")
+        if key != self._stop_key(channel):
+            return
         self._needs_stop[channel] = False
+        player = self._player_a if channel == "A" else self._player_b
+        player.reset()
+        self._stop_confirmed[channel] = key
+        self._deferred_channels.discard(channel)
         self._failures[channel] = 0
         if not self._faulted[channel]:
             self._channel_errors[channel] = ""
@@ -838,6 +971,7 @@ class CoyoteV4Controller(OutputRuntime):
         """向当前 App 和设备发送一条 device.op 请求。"""
         if not self._client_id or not self._slot_id:
             raise ConnectionError("V4 App 或设备已断开")
+        self._stop_confirmed[channel] = None
         payload = {
             "s": self._slot_id,
             "c": self._channel_number(channel),
@@ -964,37 +1098,3 @@ class CoyoteV4Controller(OutputRuntime):
         """将项目通道名转换为 V4 通道编号。"""
         return 0 if channel == "A" else 1
 
-    def _start_random_task(self, channel: str, minimum: int, maximum: int) -> None:
-        """启动指定通道的随机波形切换任务。"""
-        self._stop_random_task(channel)
-        self._random_tasks[channel] = asyncio.create_task(
-            self._random_waveform_loop(channel, minimum, maximum)
-        )
-
-    def _stop_random_task(self, channel: str) -> None:
-        """停止指定通道的随机波形切换任务。"""
-        task = self._random_tasks.pop(channel, None)
-        if task and not task.done():
-            task.cancel()
-
-    async def _random_waveform_loop(self, channel: str,
-                                    minimum: int, maximum: int) -> None:
-        """定时为一个通道选择新的随机波形。"""
-        player = self._player_a if channel == "A" else self._player_b
-        while self._running:
-            await asyncio.sleep(random.uniform(max(5, minimum), max(maximum, minimum)))
-            choices = [item for item in self._catalog.choices() if item != "恒定"]
-            if choices:
-                player.set_waveform(random.choice([item for item in choices if item != player.current_name] or choices))
-                self.telemetry.record_waveform(channel, player.current_name)
-                if self._status.bound and self._last_strength[channel] > 0:
-                    try:
-                        async with self._output_lock:
-                            if (not self._closing and self._status.bound
-                                    and not self._needs_stop[channel]
-                                    and not self._cmd_queue.has_stop(channel)
-                                    and self._last_strength[channel] > 0):
-                                await self._send_waveform(
-                                    channel, self._last_strength[channel])
-                    except Exception as error:
-                        logger.warning(f"V4 随机波形下发失败: {error}", exc_info=True)

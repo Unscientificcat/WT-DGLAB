@@ -1,7 +1,8 @@
 """战争雷霆 HUD 事件检测器。
 
-统一管理跨对局 HUD 游标、击杀/被击落文本匹配和维修边沿检测。
-被命中（部件损伤）由主控制器基于 /indicators 数据检测，不在此处。
+统一管理跨对局 HUD 记录指纹、击杀/被击落文本匹配和维修边沿检测。
+生产入口为 detect_records；部件损伤和维修生命周期由 TriggerEngine 管理。
+poll 保留旧调用兼容，不参与当前主程序的触发链路。
 """
 
 import logging
@@ -9,6 +10,7 @@ import re
 import unicodedata
 
 from .game_reader import GameReader, GameState
+from .trigger_models import GameEvent
 
 
 logger = logging.getLogger("EventDetector")
@@ -67,18 +69,21 @@ CRASH_KEYWORDS = (
 
 
 class EventDetector:
-    """持续消费 HUD 增量记录并返回当前对局的新事件。"""
+    """持续比较 HUD 完整快照并返回当前对局的新事件。"""
 
     def __init__(self, game_reader: GameReader):
         self._game_reader = game_reader
         self._last_dmg_id = 0
         self._cursor_ready = False
+        # 同一 ID 会在新对局中被覆盖；缺失、空快照和超时不清空历史。
+        self._record_fingerprints = {}
         self._repair_active = False
         self._diag_logged = 0
+        self._sequence = 0
 
     @property
     def last_dmg_id(self) -> int:
-        """返回最后一个已消费的 HUD damage ID。"""
+        """返回历史最大 HUD damage ID，仅供诊断，不用于请求或过滤。"""
         return self._last_dmg_id
 
     @property
@@ -86,16 +91,66 @@ class EventDetector:
         """返回 HUD 历史基线是否已经成功建立。"""
         return self._cursor_ready
 
+    def detect_records(self, state: GameState, current_mode: str,
+                       aircraft_events, tank_events) -> tuple[GameEvent, ...]:
+        """解析同批 HUD 全部变化；不读取网络、不仲裁也不操作设备。"""
+        if not state.hud_success:
+            return ()
+        ready = self._cursor_ready
+        records = self._consume_records(state.hud_records)
+        self._cursor_ready = True
+        if not ready:
+            logger.info("HUD 历史基线已建立：%d 个 ID；首次快照不触发",
+                        len(self._record_fingerprints))
+            return ()
+        mode = state.vehicle_type or current_mode
+        scene = "tank" if current_mode == "tank" else "aircraft"
+        config = tank_events if scene == "tank" else aircraft_events
+        player = self._normalize(str(config.player_name))
+        result = []
+        for record in records:
+            message = self._normalize(str(record.get("msg", "")))
+            kind = self._classify_hud_message(message, player) if player else ""
+            if not kind:
+                if self._diag_logged < 40:
+                    self._diag_logged += 1
+                    reason = ("未设置玩家昵称" if not player else
+                              "文本格式未知" if self._has_player(message, player)
+                              else "未匹配玩家身份")
+                    logger.info("HUD 未触发：id=%s；原因=%s；原文=%r",
+                                record.get("id"), reason, record.get("msg"))
+                continue
+            self._sequence += 1
+            event = GameEvent(
+                f"hud:{self._sequence}:{self._record_id(record)}", kind,
+                mode, scene, state.hud_sampled_at or state.sampled_at or 0.0,
+                state.event_session or (), bool(state.event_output_bound),
+                str(record.get("msg", "")),
+            )
+            result.append(event)
+            logger.info("事件识别 id=%s kind=%s mode=%s scene=%s",
+                        event.event_id, kind, mode, scene)
+        return tuple(result)
+
+    @staticmethod
+    def _has_player(actor: str, player: str) -> bool:
+        """按 Unicode 字符边界匹配昵称，排除更长昵称的相同子串。"""
+        if not player:
+            return False
+        # HUD 在昵称后追加括号包围的载具；载具名不能充当玩家身份。
+        if actor.strip() != player:
+            actor = re.sub(r"\s*\([^()]*\)\s*[.!。]*$", "", actor.strip())
+        return bool(re.search(r"(?<![\w])" + re.escape(player)
+                              + r"(?![\w])", actor))
+
     def poll(self, state: GameState, current_mode: str,
              aircraft_events, tank_events, cas_enabled: bool = True) -> dict:
-        """读取一次 HUD 增量并检测事件。
+        """读取一次 HUD 完整快照并检测记录变化。
 
-        首次成功读取只建立历史基线；游戏数据无效时继续推进游标但不返回
+        首次成功读取只建立历史基线；游戏数据无效时继续更新指纹但不返回
         事件；有效对局中返回最新的击杀、被击落或维修事件。
         """
-        success, records = self._game_reader.fetch_hudmsg_with_status(
-            self._last_dmg_id
-        )
+        success, records = self._game_reader.fetch_hudmsg_with_status(0)
         if not success:
             if not state.connected:
                 self._repair_active = False
@@ -104,13 +159,22 @@ class EventDetector:
         was_ready = self._cursor_ready
         new_records = self._consume_records(records)
         self._cursor_ready = True
+        if not was_ready:
+            logger.info(
+                "HUD 历史基线已建立：%d 个 ID；历史最大 ID=%d；首次快照不触发",
+                len(self._record_fingerprints), self._last_dmg_id,
+            )
 
         if not state.connected:
+            if was_ready and new_records:
+                logger.info(
+                    "HUD 变化已消费但不触发：无有效对局；ID/time=%s",
+                    [(self._record_id(r), r.get("time")) for r in new_records],
+                )
             self._repair_active = False
             return {}
 
         if not was_ready:
-            logger.info(f"HUD 事件游标已定位到 ID {self._last_dmg_id}")
             return {}
 
         actual_type = state.vehicle_type
@@ -119,6 +183,9 @@ class EventDetector:
             # 陆战模式上飞机仍使用陆战事件参数，但事件显示保留飞机语义。
             self._repair_active = False
             if not cas_enabled:
+                if new_records:
+                    logger.info("HUD 变化已消费但不触发：CAS 已关闭；记录数=%d",
+                                len(new_records))
                 return {}
             mode = "aircraft"
             event_config = tank_events
@@ -142,13 +209,28 @@ class EventDetector:
         return hud_event or repair_event
 
     def _consume_records(self, records: list) -> list:
-        """按 ID 排序并消费尚未处理的 HUD 记录。"""
+        """按 ID 排序，消费新 ID 或同 ID 的时间／规范化文本变化。"""
         new_records = []
-        for record in sorted(records, key=self._record_id):
+        for record in sorted((r for r in records if isinstance(r, dict)),
+                             key=self._record_id):
             record_id = self._record_id(record)
-            if record_id <= self._last_dmg_id:
+            if record_id < 0:
                 continue
-            self._last_dmg_id = record_id
+            fingerprint = (
+                record.get("time"), self._normalize(str(record.get("msg", "")))
+            )
+            previous = self._record_fingerprints.get(record_id)
+            if previous == fingerprint:
+                continue
+            self._record_fingerprints[record_id] = fingerprint
+            self._last_dmg_id = max(self._last_dmg_id, record_id)
+            if self._cursor_ready:
+                logger.info(
+                    "HUD 记录%s：ID=%d；time=%r → %r",
+                    "新增" if previous is None else "同 ID 更新",
+                    record_id, previous[0] if previous is not None else None,
+                    fingerprint[0],
+                )
             new_records.append(record)
         return new_records
 
@@ -177,7 +259,7 @@ class EventDetector:
 
     def _detect_hud_event(self, records: list, mode: str,
                           event_config) -> dict:
-        """从新增 HUD 文本中检测击杀和被击落。
+        """从新增或变化的 HUD 文本中检测击杀和被击落。
 
         未分类但包含玩家昵称的损伤消息会以限频方式写入日志，
         为后续词条校准收集真实样本。
@@ -186,6 +268,9 @@ class EventDetector:
             str(getattr(event_config, "player_name", ""))
         )
         if not player_name:
+            if records:
+                logger.info("HUD 变化已消费但不触发：未设置玩家昵称；记录数=%d",
+                            len(records))
             return {}
 
         result = {}
@@ -195,6 +280,12 @@ class EventDetector:
                 continue
 
             kind = self._classify_hud_message(message, player_name)
+            logger.info(
+                "HUD 匹配结果：ID=%d；time=%r；mode=%s；kind=%s；enabled=%s",
+                self._record_id(record), record.get("time"), mode,
+                kind or "未分类",
+                bool(kind and getattr(event_config, f"{kind}_enabled", False)),
+            )
             if kind == "kill" and getattr(
                     event_config, "kill_enabled", False):
                 result = self._build_event("kill", mode, event_config)
@@ -216,23 +307,25 @@ class EventDetector:
             before, separator, after = message.partition(keyword)
             if not separator:
                 continue
-            if player_name in before:
+            if EventDetector._has_player(before, player_name):
                 return "death"
-            if player_name in after:
+            if EventDetector._has_player(after, player_name):
                 return "kill"
 
         for keyword in ACTIVE_DESTROY_KEYWORDS:
             before, separator, after = message.partition(keyword)
             if not separator:
                 continue
-            if player_name in before:
+            if EventDetector._has_player(before, player_name):
                 return "kill"
-            if player_name in after:
+            if EventDetector._has_player(after, player_name):
                 return "death"
 
         for keyword in CRASH_KEYWORDS:
             before, separator, _after = message.partition(keyword)
-            if separator and player_name in before:
+            # 中文坠毁模板会在昵称后附加“的载具”，属于语法而非昵称。
+            actor = re.sub(r"的(?:载具|載具)$", "", before.strip())
+            if separator and EventDetector._has_player(actor, player_name):
                 return "death"
 
         return ""
@@ -256,11 +349,11 @@ class EventDetector:
 
     @staticmethod
     def _record_id(record: dict) -> int:
-        """安全读取 HUD 记录 ID，无效值按 0 处理。"""
+        """安全读取 HUD 记录 ID，无效值按 -1 处理。"""
         try:
-            return int(record.get("id", 0))
+            return int(record.get("id", -1))
         except (AttributeError, TypeError, ValueError):
-            return 0
+            return -1
 
     @staticmethod
     def _normalize(text: str) -> str:
